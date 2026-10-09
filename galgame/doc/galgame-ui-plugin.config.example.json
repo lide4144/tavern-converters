@@ -1,0 +1,79 @@
+{
+  "$schema": "./galgame-ui-plugin.config.schema.json",
+  "schema": "galgame_ui_plugin_config_v2",
+  "assets": {
+    "activePackId": "pack_main",
+    "packs": [
+      {
+        "packId": "pack_main",
+        "name": "主图包",
+        "remoteAssetsUrl": "https://cdn.jsdelivr.net/gh/yourname/yourrepo@main/remote_assets.json",
+        "remoteBaseUrl": "https://cdn.jsdelivr.net/gh/yourname/yourrepo@main/"
+      }
+    ],
+    "resourceModes": {
+      "sprites": {
+        "mode": "remote",
+        "remoteAssetsUrl": "https://cdn.jsdelivr.net/gh/yourname/yourrepo@main/remote_assets.json",
+        "remoteBaseUrl": "https://cdn.jsdelivr.net/gh/yourname/yourrepo@main/"
+      },
+      "backgrounds": {
+        "mode": "skip-export"
+      },
+      "live2d": {
+        "mode": "remote",
+        "includeLocalPlaceholder": true,
+        "remoteInput": "https://cdn.jsdelivr.net/gh/yourname/yourrepo@main/live2d/{character}/model3.json"
+      }
+    }
+  },
+  "live2d": {
+    "enabledMap": {
+      "柚": true
+    },
+    "models": {
+      "柚": {
+        "source": "remote",
+        "modelUrl": "https://example.com/live2d/yuzu/model3.json",
+        "transform": {
+          "slot": "left",
+          "scaleBase": "height",
+          "scale": 1,
+          "offsetX": 0,
+          "offsetY": 0
+        }
+      }
+    }
+  },
+  "tts": {
+    "enabled": true,
+    "characterVoice": {
+      "柚": "奥泽美咲"
+    }
+  },
+  "custom": {
+    "locationStatusHtml": "<div>教学楼天台，风很大。</div>",
+    "timeStatusHtml": "<div>放学后 / 黄昏</div>",
+    "locationStatusIconClass": "fa-solid fa-location-dot",
+    "timeStatusIconClass": "fa-regular fa-clock",
+    "uiAccess": {
+      "enabled": true,
+      "hiddenAssetTabs": [
+        "custom",
+        "imagegen"
+      ],
+      "unlock": {
+        "mode": "plaintext",
+        "password": "your-password"
+      }
+    }
+  },
+  "bgm": {
+    "whitelist": [
+      "宁静校园",
+      "黄昏微风",
+      "雨夜"
+    ]
+  }
+}
+

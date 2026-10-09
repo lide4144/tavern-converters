@@ -1,0 +1,1291 @@
+import { SCRIPT_NAME } from '../core/constants.js';
+import { GalgameStore } from '../core/store.js';
+import { getSettings } from '../core/settings.js';
+import { fetchEdgeVoices, getEdgeFallbackVoices } from './edge-tts-direct.js';
+
+// ============================================
+// TTS 音色配置 (Providers)
+// ============================================
+
+export const TTS_PROVIDER = {
+  LITTLEWHITEBOX: 'littlewhitebox',
+  GPT_SOVITS_V2: 'gpt_sovits_v2',
+  EDGE_TTS_DIRECT: 'edge_tts_direct',
+};
+
+const TTS_ENABLED_KEY = GalgameStore.STORAGE_KEYS.TTS_ENABLED;
+const CHAR_TTS_VOICE_KEY = GalgameStore.STORAGE_KEYS.CHAR_TTS_VOICE;
+
+export function normalizeGptSoVitsSwitchMode(mode) {
+  const s = String(mode || '').trim().toLowerCase();
+  if (s === 'none' || s === 'off' || s === 'disabled') return 'none';
+  if (s === 'set_model' || s === 'model') return 'set_model';
+  return 'set_weights';
+}
+
+export function normalizeSetModelEndpoint(endpoint) {
+  const raw = String(endpoint || '').trim();
+  if (!raw) return '/set_model';
+  return raw.startsWith('/') ? raw : `/${raw}`;
+}
+
+function _safeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function _safeObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function _toFiniteNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function _normalizePathSep(path) {
+  let s = String(path || '');
+  if (!s) return '';
+  s = s
+    .replace(/[\u200B-\u200D\uFEFF\u2060]/g, '')
+    .replace(/\uFF3C/g, '\\')
+    .replace(/\uFF0F/g, '/')
+    .replace(/\u2215/g, '/');
+  s = s.trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
+  }
+  try {
+    s = s.normalize('NFC');
+  } catch (e) {}
+  return s.replace(/\\+/g, '/');
+}
+
+function _normalizeExpressionLookupKey(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, '');
+}
+
+function _normalizeGptSoVitsModel(model, globalDefaults = {}) {
+  if (!model || typeof model !== 'object' || Array.isArray(model)) return null;
+  const raw = _safeObject(model);
+
+  const name = String(raw.name || raw.title || raw.id || '').trim();
+  const id = String(raw.id || raw.key || raw.modelId || name).trim();
+  if (!id && !name) return null;
+
+  const rawPaths = _safeObject(raw.paths);
+  const paths = {
+    gptWeightsPath: _normalizePathSep(String(rawPaths.gptWeightsPath || raw.gptWeightsPath || raw.gpt_weights_path || '').trim()),
+    sovitsWeightsPath: _normalizePathSep(String(rawPaths.sovitsWeightsPath || raw.sovitsWeightsPath || raw.sovits_weights_path || '').trim()),
+    defaultRefAudioPath: _normalizePathSep(
+      String(rawPaths.defaultRefAudioPath || raw.defaultRefAudioPath || raw.refAudioPath || raw.ref_audio_path || '').trim(),
+    ),
+  };
+
+  const rawParams = _safeObject(raw.params);
+  const params = {
+    promptText: String(rawParams.promptText || raw.promptText || '').trim(),
+    promptLang: String(rawParams.promptLang || raw.promptLang || 'zh').trim() || 'zh',
+    textLang: String(rawParams.textLang || raw.textLang || globalDefaults.textLang || 'auto').trim() || 'auto',
+    textSplitMethod: String(rawParams.textSplitMethod || raw.textSplitMethod || globalDefaults.textSplitMethod || 'cut5').trim() || 'cut5',
+    mediaType: String(rawParams.mediaType || raw.mediaType || globalDefaults.mediaType || 'wav').trim() || 'wav',
+    streamingMode: !!(rawParams.streamingMode ?? raw.streamingMode ?? globalDefaults.streamingMode),
+    speedFactor: _toFiniteNumber(rawParams.speedFactor ?? raw.speedFactor ?? globalDefaults.speedFactor, 1),
+    strictWeightSwitch: !!(rawParams.strictWeightSwitch ?? raw.strictWeightSwitch ?? globalDefaults.strictWeightSwitch),
+    modelSwitchMode: normalizeGptSoVitsSwitchMode(rawParams.modelSwitchMode || raw.modelSwitchMode || globalDefaults.modelSwitchMode),
+    setModelEndpoint: normalizeSetModelEndpoint(rawParams.setModelEndpoint || raw.setModelEndpoint || globalDefaults.setModelEndpoint),
+  };
+
+  const refCandidates = []
+    .concat(_safeArray(raw.refAudios))
+    .concat(_safeArray(raw.refAudioList))
+    .concat(_safeArray(raw.refs));
+  const refAudios = [];
+  const seenRefIds = new Set();
+
+  for (const [index, item] of refCandidates.entries()) {
+    const refRaw = _safeObject(item);
+    const path = _normalizePathSep(String(refRaw.path || refRaw.refAudioPath || refRaw.ref_audio_path || '').trim());
+    if (!path) continue;
+
+    let refId = String(refRaw.id || refRaw.key || '').trim();
+    if (!refId) refId = `ref_${index + 1}`;
+    if (seenRefIds.has(refId)) {
+      let suffix = 2;
+      while (seenRefIds.has(`${refId}_${suffix}`)) suffix += 1;
+      refId = `${refId}_${suffix}`;
+    }
+    seenRefIds.add(refId);
+
+    refAudios.push({
+      id: refId,
+      name: String(refRaw.name || refRaw.label || refId).trim() || refId,
+      path,
+      promptText: String(refRaw.promptText || refRaw.prompt_text || params.promptText || '').trim(),
+      promptLang: String(refRaw.promptLang || refRaw.prompt_lang || params.promptLang || 'zh').trim() || 'zh',
+      textLang: String(refRaw.textLang || refRaw.text_lang || params.textLang || 'auto').trim() || 'auto',
+      expression: String(refRaw.expression || '').trim(),
+    });
+  }
+
+  let defaultRefId = String(raw.defaultRefId || raw.defaultRefAudioId || '').trim();
+  if (!defaultRefId && paths.defaultRefAudioPath) {
+    defaultRefId = refAudios.find(item => item.path === paths.defaultRefAudioPath)?.id || '';
+  }
+  if (!defaultRefId && refAudios.length > 0) {
+    defaultRefId = refAudios[0].id;
+  }
+  if (!paths.defaultRefAudioPath && defaultRefId) {
+    paths.defaultRefAudioPath = refAudios.find(item => item.id === defaultRefId)?.path || '';
+  }
+
+  const rawMap = _safeObject(raw.expressionRefMap || raw.expressionMap || raw.refMap);
+  const expressionRefMap = {};
+  for (const [expr, refId] of Object.entries(rawMap)) {
+    const key = _normalizeExpressionLookupKey(expr);
+    const value = String(refId || '').trim();
+    if (!key || !value) continue;
+    expressionRefMap[key] = value;
+  }
+  refAudios.forEach(ref => {
+    const key = _normalizeExpressionLookupKey(ref.expression);
+    if (key && ref.id && !expressionRefMap[key]) expressionRefMap[key] = ref.id;
+  });
+
+  return {
+    id: id || name,
+    name: name || id,
+    enabled: raw.enabled !== false,
+    desc: String(raw.desc || raw.description || '').trim(),
+    paths,
+    params,
+    refAudios,
+    defaultRefId,
+    expressionRefMap,
+  };
+}
+
+export function normalizeGptSoVitsModelsForStore(modelList, globalDefaults = {}) {
+  const out = [];
+  const seenIds = new Set();
+  for (const model of _safeArray(modelList)) {
+    const normalized = _normalizeGptSoVitsModel(model, globalDefaults);
+    if (!normalized) continue;
+
+    let id = String(normalized.id || '').trim() || `model_${out.length + 1}`;
+    if (seenIds.has(id)) {
+      let suffix = 2;
+      while (seenIds.has(`${id}_${suffix}`)) suffix += 1;
+      id = `${id}_${suffix}`;
+    }
+    seenIds.add(id);
+    normalized.id = id;
+    if (!normalized.name) normalized.name = id;
+    out.push(normalized);
+  }
+  return out;
+}
+
+export function getTTSProvider() {
+  try {
+    const settings = getSettings();
+    return settings?.ttsProvider || TTS_PROVIDER.LITTLEWHITEBOX;
+  } catch (e) {
+    return TTS_PROVIDER.LITTLEWHITEBOX;
+  }
+}
+
+export function getGptSoVitsConfig() {
+  const defaults = {
+    apiUrl: 'http://127.0.0.1:9880',
+    endpoint: '/tts',
+    useCorsProxy: true,
+    mediaType: 'wav',
+    streamingMode: false,
+    textLang: 'auto',
+    textSplitMethod: 'cut5',
+    speedFactor: 1,
+    strictWeightSwitch: false,
+    probeOnAudioError: false,
+    modelSwitchMode: 'set_weights',
+    setModelEndpoint: '/set_model',
+    importPathPrefix: '',
+    rootDir: '',
+    models: [],
+    voices: [],
+  };
+
+  try {
+    const settings = getSettings();
+    const cfg = settings?.gptSoVits || {};
+    const merged = Object.assign(
+      Object.assign({}, defaults),
+      cfg,
+      {
+        rootDir: _normalizePathSep(String(cfg.rootDir || cfg.importPathPrefix || '').trim()),
+        importPathPrefix: _normalizePathSep(String(cfg.importPathPrefix || cfg.rootDir || '').trim()),
+        modelSwitchMode: normalizeGptSoVitsSwitchMode(cfg.modelSwitchMode || defaults.modelSwitchMode),
+        setModelEndpoint: normalizeSetModelEndpoint(cfg.setModelEndpoint || defaults.setModelEndpoint),
+        voices: Array.isArray(cfg.voices) ? cfg.voices : defaults.voices,
+        models: Array.isArray(cfg.models) ? cfg.models : defaults.models,
+      },
+    );
+    const normalizedModels = merged.models.length > 0
+      ? normalizeGptSoVitsModelsForStore(merged.models, merged)
+      : [];
+
+    return Object.assign(
+      Object.assign({}, merged),
+      { models: normalizedModels },
+    );
+  } catch (e) {
+    return defaults;
+  }
+}
+
+function _modelToVoice(model, globalDefaults = {}) {
+  const normalized = _normalizeGptSoVitsModel(model, globalDefaults);
+  if (!normalized) return null;
+
+  const refs = _safeArray(normalized.refAudios);
+  const defaultRef =
+    refs.find(item => item.id === normalized.defaultRefId) ||
+    refs.find(item => item.path === normalized.paths?.defaultRefAudioPath) ||
+    refs[0] ||
+    null;
+
+  const name = String(normalized.name || normalized.id || '').trim();
+  if (!name) return null;
+
+  const params = _safeObject(normalized.params);
+  const refAudioPath = String(defaultRef?.path || normalized.paths?.defaultRefAudioPath || '').trim();
+
+  return {
+    name,
+    value: name,
+    source: TTS_PROVIDER.GPT_SOVITS_V2,
+    resourceId: null,
+    desc: String(normalized.desc || 'GPT-SoVITS').trim() || 'GPT-SoVITS',
+    gptSoVitsModel: normalized,
+    gptSoVits: {
+      refAudioPath,
+      promptText: String(defaultRef?.promptText || params.promptText || '').trim(),
+      promptLang: String(defaultRef?.promptLang || params.promptLang || 'zh').trim() || 'zh',
+      textLang: String(defaultRef?.textLang || params.textLang || globalDefaults.textLang || 'auto').trim() || 'auto',
+      gptWeightsPath: String(normalized.paths?.gptWeightsPath || '').trim(),
+      sovitsWeightsPath: String(normalized.paths?.sovitsWeightsPath || '').trim(),
+      modelSwitchMode: normalizeGptSoVitsSwitchMode(params.modelSwitchMode || globalDefaults.modelSwitchMode),
+      setModelEndpoint: normalizeSetModelEndpoint(params.setModelEndpoint || globalDefaults.setModelEndpoint),
+      strictWeightSwitch: !!(params.strictWeightSwitch ?? globalDefaults.strictWeightSwitch),
+      textSplitMethod: String(params.textSplitMethod || globalDefaults.textSplitMethod || 'cut5').trim() || 'cut5',
+      mediaType: String(params.mediaType || globalDefaults.mediaType || 'wav').trim() || 'wav',
+      speedFactor: _toFiniteNumber(params.speedFactor ?? globalDefaults.speedFactor, 1),
+      streamingMode: !!(params.streamingMode ?? globalDefaults.streamingMode),
+    },
+  };
+}
+
+function _getGptSoVitsVoiceSourceList(cfg) {
+  const modelVoices = normalizeGptSoVitsModelsForStore(cfg.models, cfg)
+    .map(model => _modelToVoice(model, cfg))
+    .filter(Boolean);
+  const manualVoices = _safeArray(cfg.voices).map(normalizeGptSoVitsVoice).filter(Boolean);
+
+  const mergedMap = new Map();
+  modelVoices.forEach(v => mergedMap.set(v.name, v));
+  manualVoices.forEach(v => mergedMap.set(v.name, v));
+  return Array.from(mergedMap.values());
+}
+
+export function normalizeGptSoVitsVoice(voice) {
+  if (!voice) return null;
+  const rawCfg = voice?.gptSoVits || {};
+  const modelCfg = _safeObject(voice?.gptSoVitsModel || voice?.model);
+  const modelParams = _safeObject(modelCfg.params);
+  const modelPaths = _safeObject(modelCfg.paths);
+  const name = String(voice.name || voice.voice || voice.speaker || rawCfg.name || '').trim();
+  if (!name) return null;
+
+  const refAudioPath = _normalizePathSep(
+    String(
+      voice.refAudioPath ||
+      voice.ref_audio_path ||
+      voice.ref_audio ||
+      voice.ref ||
+      rawCfg.refAudioPath ||
+      modelPaths.defaultRefAudioPath ||
+      '',
+    ).trim(),
+  );
+  const promptText = String(voice.promptText || voice.prompt_text || rawCfg.promptText || modelParams.promptText || '').trim();
+  const promptLang = String(voice.promptLang || voice.prompt_lang || rawCfg.promptLang || modelParams.promptLang || '').trim();
+  const textLang = String(voice.textLang || voice.text_lang || rawCfg.textLang || modelParams.textLang || '').trim();
+  const gptWeightsPath = _normalizePathSep(
+    String(voice.gptWeightsPath || voice.gpt_weights_path || voice.gptPath || voice.gpt || rawCfg.gptWeightsPath || modelPaths.gptWeightsPath || '').trim(),
+  );
+  const sovitsWeightsPath = _normalizePathSep(
+    String(voice.sovitsWeightsPath || voice.sovits_weights_path || voice.sovitsPath || voice.sovits || rawCfg.sovitsWeightsPath || modelPaths.sovitsWeightsPath || '').trim(),
+  );
+  const modelSwitchMode = normalizeGptSoVitsSwitchMode(
+    voice.modelSwitchMode || voice.model_switch_mode || rawCfg.modelSwitchMode || modelParams.modelSwitchMode || '',
+  );
+  const setModelEndpoint = normalizeSetModelEndpoint(
+    voice.setModelEndpoint || voice.set_model_endpoint || rawCfg.setModelEndpoint || modelParams.setModelEndpoint || '/set_model',
+  );
+  const desc = String(voice.desc || voice.description || '').trim();
+
+  return {
+    name,
+    value: name,
+    source: TTS_PROVIDER.GPT_SOVITS_V2,
+    resourceId: null,
+    desc: desc || 'GPT-SoVITS',
+    gptSoVits: {
+      refAudioPath,
+      promptText,
+      promptLang,
+      textLang,
+      gptWeightsPath,
+      sovitsWeightsPath,
+      modelSwitchMode,
+      setModelEndpoint,
+      strictWeightSwitch: !!(rawCfg.strictWeightSwitch ?? modelParams.strictWeightSwitch),
+      textSplitMethod: String(rawCfg.textSplitMethod || modelParams.textSplitMethod || '').trim(),
+      mediaType: String(rawCfg.mediaType || modelParams.mediaType || '').trim(),
+      speedFactor: _toFiniteNumber(rawCfg.speedFactor ?? modelParams.speedFactor, 1),
+      streamingMode: !!(rawCfg.streamingMode ?? modelParams.streamingMode),
+    },
+    gptSoVitsModel: Object.keys(modelCfg).length > 0 ? modelCfg : null,
+  };
+}
+
+function toGptSoVitsVoiceConfig(voice, globalDefaults = null) {
+  const normalized = normalizeGptSoVitsVoice(voice);
+  if (!normalized) return null;
+  const cfg = normalized.gptSoVits || {};
+  const globalCfg = globalDefaults || getGptSoVitsConfig();
+  const desc = String(voice?.desc || voice?.description || '').trim();
+
+  return {
+    name: normalized.name,
+    desc,
+    refAudioPath: _normalizePathSep(String(cfg.refAudioPath || '').trim()),
+    promptText: String(cfg.promptText || '').trim(),
+    promptLang: String(cfg.promptLang || '').trim(),
+    textLang: String(cfg.textLang || '').trim(),
+    gptWeightsPath: _normalizePathSep(String(cfg.gptWeightsPath || '').trim()),
+    sovitsWeightsPath: _normalizePathSep(String(cfg.sovitsWeightsPath || '').trim()),
+    modelSwitchMode: normalizeGptSoVitsSwitchMode(cfg.modelSwitchMode || globalCfg.modelSwitchMode),
+    setModelEndpoint: normalizeSetModelEndpoint(cfg.setModelEndpoint || globalCfg.setModelEndpoint),
+    strictWeightSwitch: !!(cfg.strictWeightSwitch ?? globalCfg.strictWeightSwitch),
+    textSplitMethod: String(cfg.textSplitMethod || globalCfg.textSplitMethod || '').trim(),
+    mediaType: String(cfg.mediaType || globalCfg.mediaType || '').trim(),
+    speedFactor: _toFiniteNumber(cfg.speedFactor ?? globalCfg.speedFactor, 1),
+    streamingMode: !!(cfg.streamingMode ?? globalCfg.streamingMode),
+  };
+}
+
+export function isGptSoVitsVoiceUsable(voice) {
+  const cfg = toGptSoVitsVoiceConfig(voice);
+  return !!String(cfg?.refAudioPath || '').trim();
+}
+
+export function normalizeGptSoVitsVoicesForStore(voiceList, globalDefaults = null) {
+  const out = [];
+  let ignoredCount = 0;
+  let missingRefCount = 0;
+
+  for (const voice of Array.isArray(voiceList) ? voiceList : []) {
+    const cfg = toGptSoVitsVoiceConfig(voice, globalDefaults);
+    if (!cfg) {
+      ignoredCount += 1;
+      continue;
+    }
+    if (!cfg.refAudioPath) missingRefCount += 1;
+    out.push(cfg);
+  }
+
+  return { voices: out, ignoredCount, missingRefCount };
+}
+
+export function pickFirstUsableGptSoVitsVoice(voiceList) {
+  for (const voice of Array.isArray(voiceList) ? voiceList : []) {
+    if (isGptSoVitsVoiceUsable(voice)) return voice;
+  }
+  return null;
+}
+
+export async function getGptSoVitsVoiceListAsync() {
+  const cfg = getGptSoVitsConfig();
+  return _getGptSoVitsVoiceSourceList(cfg);
+}
+
+export function getGptSoVitsVoiceList() {
+  try {
+    const cfg = getGptSoVitsConfig();
+    return _getGptSoVitsVoiceSourceList(cfg);
+  } catch (e) {
+    return [];
+  }
+}
+
+function _getFileExtLower(name) {
+  const s = String(name || '');
+  const idx = s.lastIndexOf('.');
+  return idx >= 0 ? s.slice(idx + 1).toLowerCase() : '';
+}
+
+function _stripFileExt(name) {
+  const s = String(name || '');
+  return s.replace(/\.[^./\\]+$/, '');
+}
+
+export function isAbsoluteFsPath(pathStr) {
+  const p = String(pathStr || '').trim();
+  if (!p) return false;
+  if (/^[a-zA-Z]:[\\/]/.test(p)) return true;
+  if (p.startsWith('\\\\')) return true;
+  if (p.startsWith('/')) return true;
+  return false;
+}
+
+function _joinPathPrefix(prefix, relPath) {
+  const p = String(prefix || '').trim();
+  const rel = String(relPath || '').trim();
+  if (!p) return rel;
+  const useBackslash = p.includes('\\') && !p.includes('/');
+  const sep = useBackslash ? '\\' : '/';
+  const cleanPrefix = p.replace(/[\\/]+$/, '');
+  const cleanRel = rel.replace(/^[\\/]+/, '');
+  if (!cleanRel) return cleanPrefix;
+
+  const normalizedRel = useBackslash ? cleanRel.replace(/[\\/]+/g, '\\') : cleanRel.replace(/[\\/]+/g, '/');
+  const normalizedPrefix = useBackslash ? cleanPrefix.replace(/[\\/]+/g, '\\') : cleanPrefix.replace(/[\\/]+/g, '/');
+  const lowerPrefix = normalizedPrefix.toLowerCase();
+  const lowerRel = normalizedRel.toLowerCase();
+  if (lowerRel === lowerPrefix || lowerRel.startsWith(`${lowerPrefix}${sep}`)) return normalizedRel;
+
+  const prefixSegs = normalizedPrefix.split(/[\\/]+/).filter(Boolean);
+  const relSegs = normalizedRel.split(/[\\/]+/).filter(Boolean);
+  if (prefixSegs.length > 0 && relSegs.length > 0) {
+    const tail = prefixSegs[prefixSegs.length - 1];
+    const head = relSegs[0];
+    if (tail && head && tail.toLowerCase() === head.toLowerCase()) {
+      return prefixSegs.concat(relSegs.slice(1)).join(sep);
+    }
+  }
+  return `${normalizedPrefix}${sep}${normalizedRel}`;
+}
+
+function _inferLangFromText(text) {
+  const t = String(text || '');
+  if (/[\u3040-\u30ff]/.test(t)) return 'ja';
+  if (/[\uac00-\ud7af]/.test(t)) return 'ko';
+  if (/[a-zA-Z]/.test(t) && !/[\u4e00-\u9fff]/.test(t)) return 'en';
+  if (/[\u4e00-\u9fff]/.test(t)) return 'zh';
+  return 'zh';
+}
+
+function _cleanPromptTextFromFilenameBase(baseName) {
+  let t = String(baseName || '').trim();
+  if (!t) return '';
+  t = t.replace(/^[\s\uFEFF]*(?:[(（\[【][^)）\]】]{1,10}[)）\]】])\s*/u, '');
+  t = t.replace(/[.…。．.]+$/u, '');
+  t = t.replace(/\.{3,}/g, '…');
+  return t.trim();
+}
+
+function _cleanVoiceNameFromWeightsBase(baseName) {
+  let t = String(baseName || '').trim();
+  if (!t) return '';
+  t = t.replace(/^[A-Za-z0-9]{2,8}[_-]+/, '');
+  const suffixes = [
+    /[_-]v\d+(?:proplus|pro|pp|p)?$/i,
+    /[_-](?:v2pp|v2p|v2|v3|v4)$/i,
+    /[_-](?:proplus|pro|pp|p)$/i,
+    /[_-](?:gpt|sovits|so-vits|vits)$/i,
+  ];
+  for (let i = 0; i < 4; i += 1) {
+    const before = t;
+    for (const re of suffixes) t = t.replace(re, '');
+    if (t === before) break;
+    t = t.trim();
+  }
+  return t.trim();
+}
+
+function _pickLargestFile(files) {
+  if (!Array.isArray(files) || files.length === 0) return null;
+  return files.slice().sort((a, b) => (b.size || 0) - (a.size || 0))[0];
+}
+
+function _pickBestAudioFile(audioFiles) {
+  if (!Array.isArray(audioFiles) || audioFiles.length === 0) return null;
+  const candidates = audioFiles.map(file => {
+    const base = _stripFileExt(file.name);
+    const promptText = _cleanPromptTextFromFilenameBase(base);
+    const ext = _getFileExtLower(file.name);
+    const extScore = ext === 'wav' ? 3 : ext === 'flac' ? 2 : ext === 'ogg' ? 1 : 0;
+    const lenScore = Math.min(200, promptText.length);
+    return { file, score: extScore * 1000 + lenScore };
+  });
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0].file;
+}
+
+function _weightsStemKey(fileName) {
+  let stem = String(_stripFileExt(fileName) || '').toLowerCase().trim();
+  if (!stem) return '';
+  stem = stem.replace(/[\s._-]+/g, '');
+  stem = stem.replace(/(gpt|sovits|sovit|vits)+$/g, '');
+  return stem;
+}
+
+function _collectWeightCandidates(ckpts, pths) {
+  const ckptList = Array.isArray(ckpts) ? ckpts.slice() : [];
+  const pthList = Array.isArray(pths) ? pths.slice() : [];
+  if (ckptList.length === 0 && pthList.length === 0) return [];
+  ckptList.sort((a, b) => (b.size || 0) - (a.size || 0));
+  pthList.sort((a, b) => (b.size || 0) - (a.size || 0));
+
+  const ckptByBase = new Map();
+  const ckptByStem = new Map();
+  ckptList.forEach(file => {
+    const base = _stripFileExt(file.name).toLowerCase();
+    if (!ckptByBase.has(base)) ckptByBase.set(base, file);
+    const stem = _weightsStemKey(file.name);
+    if (stem && !ckptByStem.has(stem)) ckptByStem.set(stem, file);
+  });
+
+  const out = [];
+  const used = new Set();
+  const addCandidate = (gptFile, sovitsFile) => {
+    if (!gptFile && !sovitsFile) return;
+    const key = `${gptFile?.name || ''}::${sovitsFile?.name || ''}`.toLowerCase();
+    if (used.has(key)) return;
+    used.add(key);
+    out.push({ gptFile: gptFile || null, sovitsFile: sovitsFile || null });
+  };
+
+  pthList.forEach(pth => {
+    const base = _stripFileExt(pth.name).toLowerCase();
+    const matched = ckptByBase.get(base) || null;
+    if (matched) addCandidate(matched, pth);
+  });
+  pthList.forEach(pth => {
+    const stem = _weightsStemKey(pth.name);
+    const matched = stem ? ckptByStem.get(stem) : null;
+    if (matched) addCandidate(matched, pth);
+  });
+  if (out.length === 0) {
+    addCandidate(_pickLargestFile(ckptList), _pickLargestFile(pthList));
+  }
+
+  const usedGpt = new Set(out.map(item => item.gptFile?.name).filter(Boolean));
+  const usedSovits = new Set(out.map(item => item.sovitsFile?.name).filter(Boolean));
+  pthList.forEach(file => {
+    if (!usedSovits.has(file.name)) addCandidate(null, file);
+  });
+  ckptList.forEach(file => {
+    if (!usedGpt.has(file.name)) addCandidate(file, null);
+  });
+  return out;
+}
+
+function _inferExpressionTagFromAudioName(baseName) {
+  const name = String(baseName || '').trim().toLowerCase();
+  if (!name) return '';
+  const rules = [
+    { tag: '开心', patterns: ['happy', 'smile', 'laugh', 'joy', '开心', '高兴', '喜悦', '愉快', '兴奋'] },
+    { tag: '生气', patterns: ['angry', 'mad', 'rage', '生气', '愤怒', '恼火'] },
+    { tag: '悲伤', patterns: ['sad', 'cry', 'sob', '悲伤', '难过', '伤心'] },
+    { tag: '惊讶', patterns: ['surprise', 'wow', '惊讶', '震惊', '吃惊'] },
+    { tag: '害羞', patterns: ['shy', 'blush', '害羞', '脸红'] },
+    { tag: '冷静', patterns: ['calm', 'normal', 'neutral', '平静', '冷静', '默认'] },
+  ];
+  for (const rule of rules) {
+    if (rule.patterns.some(pattern => name.includes(pattern))) return rule.tag;
+  }
+  return '';
+}
+
+export function buildGptSoVitsModelId(prefix = 'model') {
+  const raw = String(prefix || 'model').trim();
+  const safe = (raw || 'model').replace(/[^\p{L}\p{N}_-]+/gu, '_').replace(/^_+|_+$/g, '') || 'model';
+  return `${safe}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export function normalizeGptSoVitsModelForStore(model, globalDefaults = null) {
+  const defaults = globalDefaults || getGptSoVitsConfig();
+  const normalized = _normalizeGptSoVitsModel(model, defaults);
+  if (!normalized) return null;
+  if (!String(normalized.id || '').trim()) normalized.id = buildGptSoVitsModelId(normalized.name || 'model');
+  if (!String(normalized.name || '').trim()) normalized.name = normalized.id;
+  return normalized;
+}
+
+export function buildRuntimeVoiceFromGptSoVitsModel(model, globalDefaults = null) {
+  const defaults = globalDefaults || getGptSoVitsConfig();
+  return _modelToVoice(model, defaults);
+}
+
+export function inferGptSoVitsModelsFromFolderFiles(fileList, importPathPrefix = '', importOptions = {}) {
+  const files = Array.from(fileList || []).filter(Boolean);
+  if (files.length === 0) return [];
+  const normalizedImportPrefix = _normalizePathSep(String(importPathPrefix || '').trim());
+  const rootHintRaw = String(importOptions?.relativeRootName || '').trim();
+  const normalizedRootHint = _normalizePathSep(rootHintRaw).replace(/^[\\/]+|[\\/]+$/g, '');
+
+  const normalizeRelativePath = file => {
+    let rel = _normalizePathSep(String(file?.webkitRelativePath || file?.name || '').trim()).replace(/^[\\/]+/, '');
+    if (!rel) return '';
+    if (!normalizedRootHint) return rel;
+    const lowerRel = rel.toLowerCase();
+    const lowerRoot = normalizedRootHint.toLowerCase();
+    if (lowerRel === lowerRoot || lowerRel.startsWith(`${lowerRoot}/`)) return rel;
+    return `${normalizedRootHint}/${rel}`;
+  };
+
+  const groups = new Map();
+  for (const file of files) {
+    const rel = normalizeRelativePath(file);
+    const dir = rel.split('/').slice(0, -1).join('/');
+    const key = dir || '__root__';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(file);
+  }
+
+  const cfg = getGptSoVitsConfig();
+  const models = [];
+
+  for (const [dirKey, groupFiles] of groups.entries()) {
+    const ckpts = [];
+    const pths = [];
+    const audios = [];
+    for (const file of groupFiles) {
+      const ext = _getFileExtLower(file.name);
+      if (ext === 'ckpt') ckpts.push(file);
+      else if (ext === 'pth') pths.push(file);
+      else if (['wav', 'mp3', 'flac', 'ogg', 'm4a', 'aac'].includes(ext)) audios.push(file);
+    }
+    if (ckpts.length === 0 && pths.length === 0 && audios.length === 0) continue;
+
+    const toServerPath = file => {
+      const abs = _normalizePathSep(typeof file?.path === 'string' ? String(file.path) : '');
+      if (isAbsoluteFsPath(abs)) return abs;
+      const rel = normalizeRelativePath(file);
+      if (!rel) return '';
+      const prefixed = _normalizePathSep(_joinPathPrefix(normalizedImportPrefix, rel));
+      return prefixed || rel;
+    };
+
+    const audioCandidates = audios
+      .map(file => {
+        const base = _stripFileExt(file.name);
+        const promptText = _cleanPromptTextFromFilenameBase(base);
+        const inferredTag = _inferExpressionTagFromAudioName(base);
+        return { file, promptText, inferredTag };
+      })
+      .filter(item => !!item.file);
+
+    const bestAudio = _pickBestAudioFile(audios);
+    const weightCandidatesRaw = _collectWeightCandidates(ckpts, pths);
+    const weightCandidates = weightCandidatesRaw.length > 0 ? weightCandidatesRaw : [{ gptFile: null, sovitsFile: null }];
+    const dirName = dirKey !== '__root__' ? dirKey.split('/').pop() : '';
+    const groupNameUsed = new Set();
+
+    for (const pair of weightCandidates) {
+      const gptFile = pair.gptFile || null;
+      const sovitsFile = pair.sovitsFile || null;
+      const weightsBase = _stripFileExt((sovitsFile || gptFile || bestAudio || {}).name || '');
+      const baseName = _cleanVoiceNameFromWeightsBase(weightsBase) || _cleanVoiceNameFromWeightsBase(dirName) || '新模型';
+      let modelName = baseName;
+      let idx = 2;
+      while (groupNameUsed.has(modelName)) {
+        modelName = `${baseName}_${idx++}`;
+      }
+      groupNameUsed.add(modelName);
+
+      const refAudios = [];
+      const expressionRefMap = {};
+      const defaultRefBase = bestAudio ? _normalizePathSep(toServerPath(bestAudio)) : '';
+
+      audioCandidates.forEach((item, audioIndex) => {
+        const path = _normalizePathSep(toServerPath(item.file));
+        if (!path) return;
+        const id = `ref_${audioIndex + 1}`;
+        const name = _stripFileExt(item.file.name) || `参考音频${audioIndex + 1}`;
+        const text = String(item.promptText || '').trim();
+        const lang = text ? _inferLangFromText(text) : 'zh';
+        refAudios.push({ id, name, path, promptText: text, promptLang: lang, textLang: lang });
+        if (item.inferredTag && !expressionRefMap[item.inferredTag]) {
+          expressionRefMap[item.inferredTag] = id;
+        }
+      });
+
+      const defaultRef = refAudios.find(item => item.path === defaultRefBase) || refAudios[0] || null;
+      const defaultPromptText = String(defaultRef?.promptText || '').trim();
+      const defaultLang = defaultPromptText ? _inferLangFromText(defaultPromptText) : 'zh';
+
+      const model = {
+        id: buildGptSoVitsModelId(modelName),
+        name: modelName,
+        enabled: true,
+        desc: '文件夹导入',
+        paths: {
+          gptWeightsPath: gptFile ? _normalizePathSep(toServerPath(gptFile)) : '',
+          sovitsWeightsPath: sovitsFile ? _normalizePathSep(toServerPath(sovitsFile)) : '',
+          defaultRefAudioPath: defaultRef?.path || '',
+        },
+        params: {
+          promptText: defaultPromptText,
+          promptLang: defaultRef?.promptLang || defaultLang,
+          textLang: defaultRef?.textLang || defaultLang,
+          textSplitMethod: cfg.textSplitMethod || 'cut5',
+          speedFactor: _toFiniteNumber(cfg.speedFactor, 1),
+          mediaType: cfg.mediaType || 'wav',
+          streamingMode: !!cfg.streamingMode,
+          modelSwitchMode: normalizeGptSoVitsSwitchMode(cfg.modelSwitchMode || 'set_weights'),
+          setModelEndpoint: String(cfg.setModelEndpoint || '/set_model').trim() || '/set_model',
+          strictWeightSwitch: !!cfg.strictWeightSwitch,
+        },
+        refAudios,
+        defaultRefId: defaultRef?.id || '',
+        expressionRefMap,
+      };
+      if (model.paths.defaultRefAudioPath) models.push(model);
+    }
+  }
+
+  return normalizeGptSoVitsModelsForStore(models, cfg);
+}
+
+const GPT_SOVITS_AUTO_IMPORT_GPT_DIRS = [
+  'GPT_weights',
+  'GPT_weights_v2',
+  'GPT_weights_v2Pro',
+  'GPT_weights_v2ProPlus',
+  'GPT_weights_v3',
+  'GPT_weights_v4',
+];
+const GPT_SOVITS_AUTO_IMPORT_SOVITS_DIRS = [
+  'SoVITS_weights',
+  'SoVITS_weights_v2',
+  'SoVITS_weights_v2Pro',
+  'SoVITS_weights_v2ProPlus',
+  'SoVITS_weights_v3',
+  'SoVITS_weights_v4',
+];
+
+function _getNodeFsBridge() {
+  const hostList = [];
+  try {
+    hostList.push(window);
+  } catch (e) {}
+  try {
+    const host = typeof window.parent !== 'undefined' ? window.parent : window;
+    if (host && !hostList.includes(host)) hostList.push(host);
+  } catch (e) {}
+
+  for (const host of hostList) {
+    const req = typeof host?.require === 'function' ? host.require : null;
+    if (!req) continue;
+    try {
+      const fs = req('fs');
+      const fsp = fs?.promises || req('fs/promises');
+      const path = req('path');
+      if (fsp && path) return { fsp, path };
+    } catch (e) {}
+  }
+  return null;
+}
+
+async function _walkNodeFsCollectByExt(fsp, pathModule, baseDir, expectedExt) {
+  const out = [];
+  const stack = [String(baseDir || '').trim()];
+  const visited = new Set();
+  while (stack.length > 0) {
+    const current = String(stack.pop() || '').trim();
+    if (!current) continue;
+    const currentKey = _normalizePathSep(current).toLowerCase();
+    if (visited.has(currentKey)) continue;
+    visited.add(currentKey);
+
+    let entries = [];
+    try {
+      entries = await fsp.readdir(current, { withFileTypes: true });
+    } catch (e) {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const name = String(entry?.name || '').trim();
+      if (!name) continue;
+      const full = pathModule.join(current, name);
+      if (entry?.isDirectory?.()) {
+        stack.push(full);
+        continue;
+      }
+      if (!entry?.isFile?.()) continue;
+      if (_getFileExtLower(name) !== expectedExt) continue;
+      out.push({ name, path: _normalizePathSep(full) });
+    }
+  }
+  return out;
+}
+
+export async function inferGptSoVitsModelsFromRootDir(rootDirInput = '') {
+  const rootDir = _normalizePathSep(String(rootDirInput || '').trim());
+  if (!rootDir) return { models: [], rootDir, totalWeightFiles: 0, error: 'empty-root' };
+
+  const bridge = _getNodeFsBridge();
+  if (!bridge?.fsp || !bridge?.path) return { models: [], rootDir, totalWeightFiles: 0, error: 'fs-unavailable' };
+  const { fsp, path: pathModule } = bridge;
+  const rootNative = pathModule.resolve(pathModule.sep === '\\' ? rootDir.replace(/\//g, '\\') : rootDir);
+
+  try {
+    const stat = await fsp.stat(rootNative);
+    if (!stat?.isDirectory?.()) return { models: [], rootDir, totalWeightFiles: 0, error: 'root-not-found' };
+  } catch (e) {
+    return { models: [], rootDir, totalWeightFiles: 0, error: 'root-not-found' };
+  }
+
+  const collectFromSubDirs = async (subDirs, expectedExt, kind) => {
+    const all = [];
+    for (const subDirName of subDirs) {
+      const abs = pathModule.join(rootNative, subDirName);
+      const files = await _walkNodeFsCollectByExt(fsp, pathModule, abs, expectedExt);
+      files.forEach(file => {
+        all.push(Object.assign({}, file, { kind, folder: subDirName, baseName: _stripFileExt(file.name) }));
+      });
+    }
+    return all;
+  };
+
+  const [gptFiles, sovitsFiles] = await Promise.all([
+    collectFromSubDirs(GPT_SOVITS_AUTO_IMPORT_GPT_DIRS, 'ckpt', 'gpt'),
+    collectFromSubDirs(GPT_SOVITS_AUTO_IMPORT_SOVITS_DIRS, 'pth', 'sovits'),
+  ]);
+
+  const pairMap = new Map();
+  const addToPairMap = (file, field) => {
+    const key = String(file?.baseName || '').trim().toLowerCase();
+    if (!key) return;
+    if (!pairMap.has(key)) pairMap.set(key, { baseName: String(file.baseName || '').trim(), gpt: [], sovits: [] });
+    pairMap.get(key)[field].push(file);
+  };
+  gptFiles.forEach(file => addToPairMap(file, 'gpt'));
+  sovitsFiles.forEach(file => addToPairMap(file, 'sovits'));
+
+  const cfg = getGptSoVitsConfig();
+  const discovered = [];
+  const usedNames = new Set();
+
+  Array.from(pairMap.values())
+    .sort((a, b) => String(a.baseName || '').localeCompare(String(b.baseName || ''), 'zh-Hans-CN'))
+    .forEach(pairGroup => {
+      const gptList = _safeArray(pairGroup.gpt).sort((a, b) => String(a?.path || '').localeCompare(String(b?.path || ''), 'en'));
+      const sovitsList = _safeArray(pairGroup.sovits).sort((a, b) => String(a?.path || '').localeCompare(String(b?.path || ''), 'en'));
+      const count = Math.max(gptList.length, sovitsList.length, 1);
+      for (let i = 0; i < count; i += 1) {
+        const gptFile = gptList[i] || gptList[0] || null;
+        const sovitsFile = sovitsList[i] || sovitsList[0] || null;
+        if (!gptFile && !sovitsFile) continue;
+        const baseName = _cleanVoiceNameFromWeightsBase(pairGroup.baseName) || pairGroup.baseName || '模型';
+        let modelName = baseName;
+        let seq = 2;
+        while (usedNames.has(modelName.toLowerCase())) modelName = `${baseName}_${seq++}`;
+        usedNames.add(modelName.toLowerCase());
+
+        const normalized = _normalizeGptSoVitsModel(
+          {
+            id: buildGptSoVitsModelId(modelName),
+            name: modelName,
+            enabled: true,
+            desc: '根目录自动导入',
+            paths: {
+              gptWeightsPath: _normalizePathSep(String(gptFile?.path || '').trim()),
+              sovitsWeightsPath: _normalizePathSep(String(sovitsFile?.path || '').trim()),
+              defaultRefAudioPath: '',
+            },
+            params: {
+              promptText: '',
+              promptLang: 'zh',
+              textLang: cfg.textLang || 'auto',
+              textSplitMethod: cfg.textSplitMethod || 'cut5',
+              speedFactor: _toFiniteNumber(cfg.speedFactor, 1),
+              mediaType: cfg.mediaType || 'wav',
+              streamingMode: !!cfg.streamingMode,
+              modelSwitchMode: normalizeGptSoVitsSwitchMode(cfg.modelSwitchMode || 'set_weights'),
+              setModelEndpoint: String(cfg.setModelEndpoint || '/set_model').trim() || '/set_model',
+              strictWeightSwitch: !!cfg.strictWeightSwitch,
+            },
+            refAudios: [],
+            defaultRefId: '',
+            expressionRefMap: {},
+          },
+          cfg,
+        );
+        if (normalized) discovered.push(normalized);
+      }
+    });
+
+  return {
+    models: normalizeGptSoVitsModelsForStore(discovered, cfg),
+    rootDir: _normalizePathSep(rootNative),
+    totalWeightFiles: gptFiles.length + sovitsFiles.length,
+    error: '',
+  };
+}
+
+export function mergeAutoImportedGptSoVitsModels(currentModels, discoveredModels, cfg = getGptSoVitsConfig()) {
+  const next = normalizeGptSoVitsModelsForStore(_safeArray(currentModels), cfg);
+  let added = 0;
+  let updated = 0;
+
+  _safeArray(discoveredModels).forEach(item => {
+    const incoming = _normalizeGptSoVitsModel(item, cfg);
+    if (!incoming) return;
+    const incomingName = String(incoming.name || '').trim().toLowerCase();
+    if (!incomingName) return;
+    const index = next.findIndex(model => String(model?.name || '').trim().toLowerCase() === incomingName);
+    if (index < 0) {
+      next.push(incoming);
+      added += 1;
+      return;
+    }
+
+    const current = next[index];
+    const prevGpt = String(current?.paths?.gptWeightsPath || '').trim();
+    const prevSovits = String(current?.paths?.sovitsWeightsPath || '').trim();
+    const nextGpt = String(incoming?.paths?.gptWeightsPath || '').trim() || prevGpt;
+    const nextSovits = String(incoming?.paths?.sovitsWeightsPath || '').trim() || prevSovits;
+    if (nextGpt === prevGpt && nextSovits === prevSovits) return;
+
+    next[index] = _normalizeGptSoVitsModel(
+      Object.assign({}, current, {
+        desc: String(current?.desc || '').trim() || String(incoming?.desc || '').trim(),
+        paths: Object.assign({}, _safeObject(current.paths), {
+          gptWeightsPath: nextGpt,
+          sovitsWeightsPath: nextSovits,
+        }),
+      }),
+      cfg,
+    );
+    updated += 1;
+  });
+
+  return {
+    models: normalizeGptSoVitsModelsForStore(next, cfg),
+    added,
+    updated,
+    changed: added > 0 || updated > 0,
+  };
+}
+
+// LittleWhiteBox TTS 缓存
+let _lwbTtsCache = null;
+let _lwbTtsCacheTime = 0;
+const LWB_TTS_CACHE_MS = 5000;
+
+let _edgeTtsCache = null;
+let _edgeTtsCacheTime = 0;
+const EDGE_TTS_CACHE_MS = 2 * 60 * 1000;
+
+function _extractEdgeVoiceLocale(voice) {
+  const shortName = String(voice?.value || voice?.name || '').trim();
+  const shortNameMatch = shortName.match(/^([a-z]{2,3}-[a-z]{2,3})-/i);
+  if (shortNameMatch?.[1]) return String(shortNameMatch[1]).toLowerCase();
+
+  const desc = String(voice?.desc || '').trim();
+  const descMatch = desc.match(/\b([a-z]{2,3}-[a-z]{2,3})\b/i);
+  if (descMatch?.[1]) return String(descMatch[1]).toLowerCase();
+  return '';
+}
+
+function _isEdgeZhJaVoice(voice) {
+  const locale = _extractEdgeVoiceLocale(voice);
+  return locale.startsWith('zh-') || locale.startsWith('ja-');
+}
+
+function _normalizeAndFilterEdgeVoices(voiceList) {
+  const out = [];
+  const seen = new Set();
+
+  for (const voice of _safeArray(voiceList)) {
+    if (!_isEdgeZhJaVoice(voice)) continue;
+
+    const name = String(voice?.name || voice?.value || '').trim();
+    const value = String(voice?.value || voice?.name || '').trim();
+    if (!name || !value) continue;
+
+    const key = `${name.toLowerCase()}::${value.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    out.push({
+      name,
+      value,
+      source: voice?.source || TTS_PROVIDER.EDGE_TTS_DIRECT,
+      resourceId: null,
+      desc: String(voice?.desc || '').trim() || 'EdgeTTS Direct',
+    });
+  }
+
+  return out.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+}
+
+export async function getEdgeDirectVoiceListAsync() {
+  const now = Date.now();
+  if (_edgeTtsCache && now - _edgeTtsCacheTime <= EDGE_TTS_CACHE_MS) {
+    return _edgeTtsCache;
+  }
+
+  try {
+    const voices = _normalizeAndFilterEdgeVoices(await fetchEdgeVoices());
+    if (voices.length > 0) {
+      _edgeTtsCache = voices;
+      _edgeTtsCacheTime = now;
+      return voices;
+    }
+  } catch (e) {
+    console.warn(`[${SCRIPT_NAME}] EdgeTTS 直连音色拉取失败，使用本地兜底:`, e);
+  }
+
+  const fallback = _normalizeAndFilterEdgeVoices(getEdgeFallbackVoices());
+  _edgeTtsCache = fallback;
+  _edgeTtsCacheTime = now;
+  return fallback;
+}
+
+export function getEdgeDirectVoiceList() {
+  if (_edgeTtsCache && _edgeTtsCache.length > 0) {
+    return _edgeTtsCache;
+  }
+  return _normalizeAndFilterEdgeVoices(getEdgeFallbackVoices());
+}
+
+async function fetchLittleWhiteBoxTTSConfig() {
+  try {
+    const response = await fetch('/user/files/LittleWhiteBox_TTS.json', { cache: 'no-cache' });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data?.volc?.mySpeakers || null;
+  } catch (e) {
+    console.log(`[${SCRIPT_NAME}] 获取 LittleWhiteBox TTS 配置失败:`, e);
+    return null;
+  }
+}
+
+export async function getTTSVoiceListAsync() {
+  const provider = getTTSProvider();
+  if (provider === TTS_PROVIDER.GPT_SOVITS_V2) {
+    return getGptSoVitsVoiceListAsync();
+  }
+  if (provider === TTS_PROVIDER.EDGE_TTS_DIRECT) {
+    return getEdgeDirectVoiceListAsync();
+  }
+
+  const now = Date.now();
+  if (!_lwbTtsCache || (now - _lwbTtsCacheTime) > LWB_TTS_CACHE_MS) {
+    const mySpeakers = await fetchLittleWhiteBoxTTSConfig();
+    if (mySpeakers && mySpeakers.length > 0) {
+      _lwbTtsCache = mySpeakers.map(s => ({
+        name: s.name,
+        value: s.value,
+        source: s.source || (isFreeVoice(s.value) ? 'free' : 'auth'),
+        resourceId: s.resourceId || inferResourceId(s.value),
+        desc: getVoiceDesc(s.value)
+      }));
+      _lwbTtsCacheTime = now;
+      return _lwbTtsCache;
+    }
+  } else if (_lwbTtsCache) {
+    return _lwbTtsCache;
+  }
+
+  const xbTts = window.xiaobaixTts;
+  if (xbTts?.getConfig) {
+    const config = xbTts.getConfig();
+    const mySpeakers = config?.volc?.mySpeakers || [];
+    if (mySpeakers.length > 0) {
+      return mySpeakers.map(s => ({
+        name: s.name,
+        value: s.value,
+        source: s.source || (isFreeVoice(s.value) ? 'free' : 'auth'),
+        resourceId: s.resourceId || inferResourceId(s.value),
+        desc: getVoiceDesc(s.value)
+      }));
+    }
+  }
+
+  if (window.XB_TTS_VOICE_DATA?.length > 0) {
+    return window.XB_TTS_VOICE_DATA.slice(0, 20).map(v => ({
+      name: v.name,
+      value: v.value,
+      source: inferSource(v.value),
+      resourceId: inferResourceId(v.value),
+      desc: v.scene || '预设音色'
+    }));
+  }
+
+  return getDefaultFreeVoices();
+}
+
+export function getTTSVoiceList() {
+  const provider = getTTSProvider();
+  if (provider === TTS_PROVIDER.GPT_SOVITS_V2) {
+    return getGptSoVitsVoiceList();
+  }
+  if (provider === TTS_PROVIDER.EDGE_TTS_DIRECT) {
+    return getEdgeDirectVoiceList();
+  }
+
+  if (_lwbTtsCache) {
+    return _lwbTtsCache;
+  }
+
+  const xbTts = window.xiaobaixTts;
+  if (xbTts?.getConfig) {
+    const config = xbTts.getConfig();
+    const mySpeakers = config?.volc?.mySpeakers || [];
+    if (mySpeakers.length > 0) {
+      return mySpeakers.map(s => ({
+        name: s.name,
+        value: s.value,
+        source: s.source || (isFreeVoice(s.value) ? 'free' : 'auth'),
+        resourceId: s.resourceId || inferResourceId(s.value),
+        desc: getVoiceDesc(s.value)
+      }));
+    }
+  }
+
+  if (window.XB_TTS_VOICE_DATA?.length > 0) {
+    return window.XB_TTS_VOICE_DATA.slice(0, 20).map(v => ({
+      name: v.name,
+      value: v.value,
+      source: inferSource(v.value),
+      resourceId: inferResourceId(v.value),
+      desc: v.scene || '预设音色'
+    }));
+  }
+
+  return getDefaultFreeVoices();
+}
+
+function isFreeVoice(value) {
+  const freeVoices = ['female_1', 'female_2', 'female_3', 'female_4', 'female_5', 'female_6', 'female_7',
+                      'male_1', 'male_2', 'male_3', 'male_4'];
+  return freeVoices.includes(value);
+}
+
+function inferSource(value) {
+  return isFreeVoice(value) ? 'free' : 'auth';
+}
+
+export function inferResourceId(value) {
+  const lower = (value || '').toLowerCase();
+  if (lower.startsWith('icl_') || lower.startsWith('s_')) return 'seed-icl-2.0';
+  if (lower.startsWith('saturn_') || lower.startsWith('uranus_') || lower.includes('_saturn_') || lower.includes('_uranus_')) return 'seed-tts-2.0';
+  return 'seed-tts-1.0';
+}
+
+function getVoiceDesc(value) {
+  const descMap = {
+    'female_1': '温柔少女(免费)', 'female_2': '清冷女声(免费)', 'female_3': '成熟御姐(免费)',
+    'female_4': '元气少女(免费)', 'female_5': '甜美声线(免费)', 'female_6': '邻家女孩(免费)',
+    'female_7': '活泼萝莉(免费)', 'male_1': '沉稳男声(免费)', 'male_2': '儒雅公子(免费)',
+    'male_3': '阳光少年(免费)', 'male_4': '磁性低音(免费)'
+  };
+  return descMap[value] || '自定义音色';
+}
+
+function getDefaultFreeVoices() {
+  return [
+    { name: '桃夭', value: 'female_1', source: 'free', resourceId: null, desc: '温柔少女(免费)' },
+    { name: '夜枭', value: 'male_1', source: 'free', resourceId: null, desc: '沉稳男声(免费)' },
+    { name: '霜华', value: 'female_2', source: 'free', resourceId: null, desc: '清冷女声(免费)' },
+    { name: '顾姐', value: 'female_3', source: 'free', resourceId: null, desc: '成熟御姐(免费)' },
+    { name: '苏菲', value: 'female_4', source: 'free', resourceId: null, desc: '元气少女(免费)' },
+    { name: '嘉欣', value: 'female_5', source: 'free', resourceId: null, desc: '甜美声线(免费)' },
+    { name: '青梅', value: 'female_6', source: 'free', resourceId: null, desc: '邻家女孩(免费)' },
+    { name: '可莉', value: 'female_7', source: 'free', resourceId: null, desc: '活泼萝莉(免费)' },
+    { name: '君泽', value: 'male_2', source: 'free', resourceId: null, desc: '儒雅公子(免费)' },
+    { name: '沐阳', value: 'male_3', source: 'free', resourceId: null, desc: '阳光少年(免费)' },
+    { name: '梓辛', value: 'male_4', source: 'free', resourceId: null, desc: '磁性低音(免费)' },
+  ];
+}
+
+export async function resolveVoiceByName(voiceName) {
+  if (!voiceName) return null;
+  const voiceList = await getTTSVoiceListAsync();
+  let voice = voiceList.find(v => v.name === voiceName);
+  if (voice) return voice;
+  voice = voiceList.find(v => v.value === voiceName);
+  if (voice) return voice;
+  const provider = getTTSProvider();
+  const defaultVoice = provider === TTS_PROVIDER.GPT_SOVITS_V2
+    ? (pickFirstUsableGptSoVitsVoice(voiceList) || voiceList[0])
+    : provider === TTS_PROVIDER.EDGE_TTS_DIRECT
+      ? voiceList[0]
+    : voiceList[0];
+  if (defaultVoice) {
+    console.warn(`[${SCRIPT_NAME}] 未找到音色 "${voiceName}"，使用默认: ${defaultVoice.name}`);
+    return defaultVoice;
+  }
+  return null;
+}
+
+// TTS_VOICE_LIST getter 兼容
+Object.defineProperty(window, 'TTS_VOICE_LIST', {
+  get: getTTSVoiceList,
+  configurable: true
+});
+
+export function getTTSEnabled() {
+  try {
+    const saved = localStorage.getItem(TTS_ENABLED_KEY);
+    if (saved === null) return true;
+    return saved === 'true';
+  } catch (e) {
+    return true;
+  }
+}
+
+export function setTTSEnabled(enabled) {
+  try {
+    localStorage.setItem(TTS_ENABLED_KEY, String(enabled));
+  } catch (e) {
+    console.error(`[${SCRIPT_NAME}] 保存TTS启用状态失败:`, e);
+  }
+}
+
+export function getCharacterTTSVoice(characterId) {
+  try {
+    const map = JSON.parse(localStorage.getItem(CHAR_TTS_VOICE_KEY) || '{}');
+    return map[characterId] || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+export function setCharacterTTSVoice(characterId, voiceName) {
+  try {
+    const map = JSON.parse(localStorage.getItem(CHAR_TTS_VOICE_KEY) || '{}');
+    if (voiceName) {
+      map[characterId] = voiceName;
+    } else {
+      delete map[characterId];
+    }
+    localStorage.setItem(CHAR_TTS_VOICE_KEY, JSON.stringify(map));
+  } catch (e) {
+    console.error(`[${SCRIPT_NAME}] 保存角色TTS音色失败:`, e);
+  }
+}
+
+export function getAllCharacterTTSVoices() {
+  try {
+    return JSON.parse(localStorage.getItem(CHAR_TTS_VOICE_KEY) || '{}');
+  } catch (e) {
+    return {};
+  }
+}

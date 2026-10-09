@@ -1,0 +1,803 @@
+import { TTSManager } from '../audio/tts-manager.js';
+import { SCRIPT_NAME } from '../core/constants.js';
+import { $ } from '../core/env.js';
+import { getCurrentCharacterName, getSettings } from '../core/settings.js';
+import { getGalgameChoicesVisible, getIsEnabled, getPendingOptions } from '../core/state.js';
+import { GalgameStore } from '../core/store.js';
+import { applyPixiEffectOps, clearAllPixiEffects, mountPixiEffects, syncPixiEffectsSettings } from '../effects/pixi-effect-manager.js';
+import { Live2DPreloadManager } from '../live2d/preload.js';
+import { checkSillyTavernGenerating, getIsGeneratingResponse, resetGenerationState } from '../logic/generation-state.js';
+import { RE_GAL_TAGS, parseGalgameContent } from '../logic/parser.js';
+import { SpriteManager } from '../sprite/sprite-manager.js';
+import { resolveCharacterIdByKeywords } from '../utils/character-name-keywords.js';
+import { getFormattedSwipeContent, getMesTextContentForGalgame, getRawMessageContent } from '../utils/html.js';
+import { updateLocationTimeDisplay } from '../utils/location-time.js';
+import { stopNextBtnAnimation, updateNextBtnForGeneratingState } from './next-btn.js';
+import { ensureGlobalOverlay, getCurrentDisplayMesId, nextOverlayRenderToken, setCurrentDisplayMesId, showGlobalOverlay } from './overlay.js';
+import { cancelTypewriter, renderTypewriterText } from './typewriter.js';
+
+// ============================================
+// 覆盖层内容更新
+// ============================================
+
+const messageSegmentState = GalgameStore.cache.segments;
+const TYPEWRITER_INSTANT_SOURCES = new Set(['skip', 'rewind', 'auto-play']);
+const DEFAULT_TWILIGHT_BRAND = 'TWILIGHT';
+
+function shouldUseTypewriterForSegment(segment) {
+  return segment?.type === 'dialogue' || segment?.type === 'narration';
+}
+
+function shouldForceInstantBySource(source) {
+  return TYPEWRITER_INSTANT_SOURCES.has(String(source || ''));
+}
+
+function syncTwilightBrandText($overlay) {
+  if (!$overlay?.length) return;
+  const nextBrand = getCurrentCharacterName() || DEFAULT_TWILIGHT_BRAND;
+  const $brand = $overlay.find('.gal-twilight-brand');
+  if ($brand.length) {
+    $brand.text(nextBrand);
+  }
+}
+
+// ============================================
+// Styled 内容 HTML 渲染
+// ============================================
+function renderStyledContent(segment) {
+  const type = segment.styleType || '';
+  const lines = segment.styledLines || [];
+  const from = segment.styledFrom || '';
+  const to = segment.styledTo || '';
+  const title = segment.styledTitle || '';
+  const date = segment.styledDate || '';
+
+  const escHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+  if (type === '手机短信' || type === 'sms' || type === '微信' || type === 'wechat') {
+    // 手机短信/微信风格
+    const selfName = to || '我';
+    let html = '<div class="gal-styled gal-styled-sms">';
+    html += '<div class="gal-sms-header">';
+    html += `<span class="gal-sms-contact">${escHtml(from || '未知联系人')}</span>`;
+    if (date) html += `<span class="gal-sms-time">${escHtml(date)}</span>`;
+    html += '</div>';
+    html += '<div class="gal-sms-body">';
+    for (const line of lines) {
+      const sender = line.sender;
+      const isSelf = sender === selfName || sender === '我' || sender === to;
+      const bubbleClass = isSelf ? 'gal-sms-bubble-self' : 'gal-sms-bubble-other';
+      const displayName = sender || from || '';
+      html += `<div class="gal-sms-row ${isSelf ? 'gal-sms-row-self' : 'gal-sms-row-other'}">`;
+      if (!isSelf && displayName) html += `<span class="gal-sms-name">${escHtml(displayName)}</span>`;
+      html += `<div class="${bubbleClass}">${escHtml(line.text)}</div>`;
+      html += '</div>';
+    }
+    html += '</div></div>';
+    return html;
+  }
+
+  if (type === '信纸' || type === 'letter') {
+    let html = '<div class="gal-styled gal-styled-letter">';
+    if (to || from) {
+      html += '<div class="gal-letter-header">';
+      if (to) html += `<span class="gal-letter-to">致 ${escHtml(to)}</span>`;
+      if (date) html += `<span class="gal-letter-date">${escHtml(date)}</span>`;
+      html += '</div>';
+    }
+    html += '<div class="gal-letter-body">';
+    for (const line of lines) {
+      html += `<p class="gal-letter-line">${escHtml(line.text)}</p>`;
+    }
+    html += '</div>';
+    if (from) html += `<div class="gal-letter-signature">—— ${escHtml(from)}</div>`;
+    html += '</div>';
+    return html;
+  }
+
+  if (type === '羊皮纸' || type === 'parchment' || type === '古卷') {
+    let html = '<div class="gal-styled gal-styled-parchment">';
+    if (title) html += `<div class="gal-parchment-title">${escHtml(title)}</div>`;
+    html += '<div class="gal-parchment-body">';
+    for (const line of lines) {
+      html += `<p class="gal-parchment-line">${escHtml(line.text)}</p>`;
+    }
+    html += '</div>';
+    if (from) html += `<div class="gal-parchment-seal">${escHtml(from)}</div>`;
+    html += '</div>';
+    return html;
+  }
+
+  if (type === '新闻' || type === '报纸' || type === 'newspaper' || type === 'news') {
+    let html = '<div class="gal-styled gal-styled-newspaper">';
+    if (title) html += `<div class="gal-newspaper-headline">${escHtml(title)}</div>`;
+    if (date || from) {
+      html += '<div class="gal-newspaper-meta">';
+      if (from) html += `<span class="gal-newspaper-source">${escHtml(from)}</span>`;
+      if (date) html += `<span class="gal-newspaper-date">${escHtml(date)}</span>`;
+      html += '</div>';
+    }
+    html += '<div class="gal-newspaper-body">';
+    for (const line of lines) {
+      html += `<p class="gal-newspaper-paragraph">${escHtml(line.text)}</p>`;
+    }
+    html += '</div>';
+    html += '</div>';
+    return html;
+  }
+
+  if (type === '电脑屏幕' || type === '终端' || type === 'terminal' || type === 'computer') {
+    let html = '<div class="gal-styled gal-styled-terminal">';
+    html += '<div class="gal-terminal-titlebar">';
+    html += '<span class="gal-terminal-dots"><i></i><i></i><i></i></span>';
+    html += `<span class="gal-terminal-title">${escHtml(title || 'Terminal')}</span>`;
+    html += '</div>';
+    html += '<div class="gal-terminal-body">';
+    for (const line of lines) {
+      const prefix = line.sender ? `<span class="gal-terminal-prompt">${escHtml(line.sender)}$</span> ` : '<span class="gal-terminal-prompt">></span> ';
+      html += `<div class="gal-terminal-line">${prefix}${escHtml(line.text)}</div>`;
+    }
+    html += '<span class="gal-terminal-cursor">_</span>';
+    html += '</div></div>';
+    return html;
+  }
+
+  if (type === '便签' || type === '纸条' || type === 'note' || type === 'sticky') {
+    let html = '<div class="gal-styled gal-styled-note">';
+    html += '<div class="gal-note-body">';
+    for (const line of lines) {
+      html += `<p class="gal-note-line">${escHtml(line.text)}</p>`;
+    }
+    html += '</div>';
+    if (from) html += `<div class="gal-note-sign">— ${escHtml(from)}</div>`;
+    html += '</div>';
+    return html;
+  }
+
+  if (type === '日记' || type === 'diary' || type === 'journal') {
+    let html = '<div class="gal-styled gal-styled-diary">';
+    html += '<div class="gal-diary-header">';
+    if (date) html += `<span class="gal-diary-date">${escHtml(date)}</span>`;
+    if (title) html += `<span class="gal-diary-mood">${escHtml(title)}</span>`;
+    html += '</div>';
+    html += '<div class="gal-diary-body">';
+    for (const line of lines) {
+      html += `<p class="gal-diary-line">${escHtml(line.text)}</p>`;
+    }
+    html += '</div>';
+    html += '</div>';
+    return html;
+  }
+
+  if (type === '公告' || type === '通知' || type === 'bulletin' || type === 'notice') {
+    let html = '<div class="gal-styled gal-styled-bulletin">';
+    html += '<div class="gal-bulletin-header">';
+    html += `<span class="gal-bulletin-icon">📢</span>`;
+    html += `<span class="gal-bulletin-title">${escHtml(title || '公告')}</span>`;
+    html += '</div>';
+    if (from || date) {
+      html += '<div class="gal-bulletin-meta">';
+      if (from) html += `<span>${escHtml(from)}</span>`;
+      if (date) html += `<span>${escHtml(date)}</span>`;
+      html += '</div>';
+    }
+    html += '<div class="gal-bulletin-body">';
+    for (const line of lines) {
+      html += `<p class="gal-bulletin-line">${escHtml(line.text)}</p>`;
+    }
+    html += '</div>';
+    html += '</div>';
+    return html;
+  }
+
+  // 未知类型回退: 简单展示
+  let html = `<div class="gal-styled gal-styled-fallback">`;
+  if (title) html += `<div class="gal-styled-fallback-title">${escHtml(title)}</div>`;
+  for (const line of lines) {
+    html += `<p>${escHtml(line.text)}</p>`;
+  }
+  html += '</div>';
+  return html;
+}
+
+async function syncEffectsForSegmentDisplay($overlay, state, currentIndex, { isNewMessage = false } = {}) {
+  if (!state) return;
+  const settings = getSettings();
+  if (!settings.effectsEnabled) {
+    clearAllPixiEffects();
+    state.lastAppliedEffectIndex = currentIndex;
+    return;
+  }
+
+  const mounted = await mountPixiEffects($overlay[0]);
+  if (!mounted) return;
+  syncPixiEffectsSettings();
+
+  const lastApplied = Number.isFinite(state.lastAppliedEffectIndex) ? state.lastAppliedEffectIndex : -1;
+  const shouldClearOnSceneChange = !!settings.effectsAutoClearOnSceneChange;
+  const shouldAutoClearOnMessageSwitch = isNewMessage;
+  const shouldReplay = shouldAutoClearOnMessageSwitch || currentIndex <= lastApplied || lastApplied < 0;
+
+  const clearIfSceneChangedAt = (segmentIndex) => {
+    if (!shouldClearOnSceneChange || segmentIndex <= 0) return;
+    const prevScene = state.segments[segmentIndex - 1]?.backgroundScene || null;
+    const currentScene = state.segments[segmentIndex]?.backgroundScene || null;
+    if (currentScene && currentScene !== prevScene) {
+      clearAllPixiEffects();
+    }
+  };
+
+  if (shouldReplay) {
+    if (shouldAutoClearOnMessageSwitch || currentIndex <= lastApplied) {
+      clearAllPixiEffects();
+    }
+    for (let i = 0; i <= currentIndex; i++) {
+      clearIfSceneChangedAt(i);
+      const ops = Array.isArray(state.segments[i]?.effectOps) ? state.segments[i].effectOps : [];
+      if (ops.length > 0) {
+        await applyPixiEffectOps(ops, $overlay[0]);
+      }
+    }
+  } else {
+    for (let i = lastApplied + 1; i <= currentIndex; i++) {
+      clearIfSceneChangedAt(i);
+      const ops = Array.isArray(state.segments[i]?.effectOps) ? state.segments[i].effectOps : [];
+      if (ops.length > 0) {
+        await applyPixiEffectOps(ops, $overlay[0]);
+      }
+    }
+  }
+
+  state.lastAppliedEffectIndex = currentIndex;
+}
+
+function queueEffectsSyncForSegmentDisplay($overlay, state, currentIndex, options = {}) {
+  if (!state) return;
+
+  state.effectSyncTicket = (Number.isFinite(state.effectSyncTicket) ? state.effectSyncTicket : 0) + 1;
+  const ticket = state.effectSyncTicket;
+
+  const run = async () => {
+    if (ticket !== state.effectSyncTicket) return;
+    try {
+      await syncEffectsForSegmentDisplay($overlay, state, currentIndex, options);
+    } catch (error) {
+      console.warn(`[${SCRIPT_NAME}] 特效同步失败`, error);
+    }
+  };
+
+  const basePromise =
+    state.effectSyncPromise && typeof state.effectSyncPromise.then === 'function'
+      ? state.effectSyncPromise
+      : Promise.resolve();
+  state.effectSyncPromise = basePromise.then(run, run);
+}
+
+function clearSpritesOnBackgroundCommand($overlay, segment) {
+  if (!segment || !Array.isArray(segment.backgroundCommands) || segment.backgroundCommands.length === 0) {
+    return false;
+  }
+  SpriteManager.reset($overlay);
+  return true;
+}
+
+function setStyledPresentationMode($overlay, enabled) {
+  if (!$overlay || !$overlay.length) return;
+  $overlay.toggleClass('gal-mode-styled', !!enabled);
+}
+
+function ensureStyledStage($overlay) {
+  const $gameContent = $overlay.find('.gal-game-content');
+  if (!$gameContent.length) return $();
+
+  let $stage = $gameContent.find('.gal-styled-stage');
+  if ($stage.length) return $stage;
+
+  $stage = $('<div class="gal-styled-stage"><div class="gal-styled-stage-content"></div></div>');
+  $gameContent.append($stage);
+  return $stage;
+}
+
+function hideStyledStage($overlay) {
+  const $stage = $overlay.find('.gal-styled-stage');
+  if (!$stage.length) return;
+  $stage.removeClass('show');
+  $stage.find('.gal-styled-stage-content').empty();
+}
+
+function showStyledStage($overlay, styledHtml) {
+  if (!styledHtml) {
+    hideStyledStage($overlay);
+    return;
+  }
+  const $stage = ensureStyledStage($overlay);
+  if (!$stage.length) return;
+  $stage.find('.gal-styled-stage-content').html(styledHtml);
+  $stage.addClass('show');
+}
+
+export async function updateGlobalOverlayContent(mesId, parsedContent, options = {}) {
+  console.log(`[${SCRIPT_NAME}] [DEBUG] updateGlobalOverlayContent CALLED for mesId=${mesId}`);
+  const $overlay = ensureGlobalOverlay();
+  const segments = parsedContent.segments;
+  const settings = getSettings();
+  const mesIdStr = String(mesId);
+  const suppressTTS = !!options.suppressTTS;
+
+  let state = messageSegmentState.get(mesIdStr);
+  if (!state) {
+    state = {
+      currentIndex: 0,
+      segments: segments,
+      parsedContent: parsedContent,
+      renderToken: 0,
+      lastAppliedEffectIndex: -1,
+      effectSyncTicket: 0,
+      effectSyncPromise: Promise.resolve(),
+    };
+    messageSegmentState.set(mesIdStr, state);
+    console.log(`[${SCRIPT_NAME}] [DEBUG] 新建状态，段落数: ${segments.length}`);
+  } else {
+    const segmentCountDiff = Math.abs(state.segments.length - segments.length);
+    if (segmentCountDiff > 5) {
+      console.log(`[${SCRIPT_NAME}] [DEBUG] 段落数变化较大 (${state.segments.length} -> ${segments.length})，重置到第一段`);
+      state.currentIndex = 0;
+      state.lastAppliedEffectIndex = -1;
+    }
+    state.segments = segments;
+    state.parsedContent = parsedContent;
+    if (!Number.isFinite(state.renderToken)) {
+      state.renderToken = 0;
+    }
+    if (!Number.isFinite(state.lastAppliedEffectIndex)) {
+      state.lastAppliedEffectIndex = -1;
+    }
+    if (!Number.isFinite(state.effectSyncTicket)) {
+      state.effectSyncTicket = 0;
+    }
+    if (!state.effectSyncPromise || typeof state.effectSyncPromise.then !== 'function') {
+      state.effectSyncPromise = Promise.resolve();
+    }
+    console.log(`[${SCRIPT_NAME}] [DEBUG] 更新状态，当前索引: ${state.currentIndex}, 段落数: ${segments.length}`);
+  }
+
+  const isNewMessage = getCurrentDisplayMesId() !== mesIdStr;
+  if (isNewMessage) {
+    console.log(`[${SCRIPT_NAME}] [DEBUG] 切换消息(${getCurrentDisplayMesId()} -> ${mesIdStr})，保留现有Live2D模型避免重载`);
+  }
+  setCurrentDisplayMesId(mesIdStr);
+
+  const renderToken = nextOverlayRenderToken(state);
+  $overlay.attr('data-render-token', String(renderToken));
+
+  const currentIndex = Math.min(state.currentIndex, segments.length - 1);
+  Live2DPreloadManager.preloadFromSegments(segments, currentIndex, 'overlay-content');
+
+  const displaySegment = segments[currentIndex] || { type: 'narration', text: '' };
+  const displayText = displaySegment.text || '';
+  const speaker = displaySegment.speaker;
+  const resolvedSpeaker = resolveCharacterIdByKeywords(speaker) || speaker;
+  const isNarration = displaySegment.type === 'narration';
+  const isCg = displaySegment.type === 'cg';
+
+  const $nameBadge = $overlay.find('.gal-name-badge');
+  const isStyled = displaySegment.type === 'styled';
+  cancelTypewriter();
+  syncTwilightBrandText($overlay);
+
+  if (isCg) {
+    setStyledPresentationMode($overlay, false);
+    hideStyledStage($overlay);
+    $nameBadge.find('span').text('CG');
+    $nameBadge.removeClass('gal-narrator-label');
+    const cgSrc = getCapturedCgImage(mesId, displaySegment.cgIndex);
+    if (cgSrc) {
+      $overlay.find('.gal-dialog-text').html(
+        '<img class="gal-cg-thumbnail" src="' + cgSrc.replace(/"/g, '&quot;') + '" />'
+      );
+    } else {
+      $overlay.find('.gal-dialog-text').text('图片生成中...');
+    }
+  } else if (isStyled) {
+    setStyledPresentationMode($overlay, true);
+    const styledLabel = {
+      '手机短信': '📱 短信', 'sms': '📱 SMS', '微信': '📱 微信', 'wechat': '📱 WeChat',
+      '信纸': '✉️ 信件', 'letter': '✉️ Letter',
+      '羊皮纸': '📜 古卷', 'parchment': '📜 Parchment', '古卷': '📜 古卷',
+      '新闻': '📰 新闻', '报纸': '📰 报纸', 'newspaper': '📰 News', 'news': '📰 News',
+      '电脑屏幕': '💻 终端', '终端': '💻 终端', 'terminal': '💻 Terminal', 'computer': '💻 Computer',
+      '便签': '📌 便签', '纸条': '📌 纸条', 'note': '📌 Note', 'sticky': '📌 Sticky',
+      '日记': '📖 日记', 'diary': '📖 Diary', 'journal': '📖 Journal',
+      '公告': '📢 公告', '通知': '📢 通知', 'bulletin': '📢 Bulletin', 'notice': '📢 Notice',
+    }[displaySegment.styleType] || displaySegment.styleType;
+    $nameBadge.find('span').text(styledLabel);
+    $nameBadge.removeClass('gal-narrator-label');
+    const styledHtml = renderStyledContent(displaySegment);
+    $overlay.find('.gal-dialog-text').text('');
+    showStyledStage($overlay, styledHtml);
+  } else {
+    setStyledPresentationMode($overlay, false);
+    hideStyledStage($overlay);
+    $nameBadge.find('span').text(resolvedSpeaker || '旁白');
+    if (isNarration) {
+      $nameBadge.addClass('gal-narrator-label');
+    } else {
+      $nameBadge.removeClass('gal-narrator-label');
+    }
+    const enableTypewriter = shouldUseTypewriterForSegment(displaySegment);
+    renderTypewriterText($overlay.find('.gal-dialog-text'), displayText, {
+      instant: !enableTypewriter,
+    });
+  }
+
+  const total = segments.length;
+  const progressPercent = total > 0 ? ((currentIndex + 1) / total) * 100 : 0;
+  $overlay.find('.gal-progress-bar').css('width', `${progressPercent}%`);
+
+  await SpriteManager.applySpriteCommands($overlay, displaySegment.spriteCommands, renderToken);
+  clearSpritesOnBackgroundCommand($overlay, displaySegment);
+  const expression = displaySegment.expression || '默认';
+  await SpriteManager.updateSprite($overlay, resolvedSpeaker, expression, renderToken);
+
+  const sceneToApply = displaySegment.backgroundScene || parsedContent.currentBackground?.scene;
+  if (sceneToApply) {
+    await SpriteManager.applySceneTint($overlay, sceneToApply);
+    console.log(`[${SCRIPT_NAME}] [DEBUG] 应用背景场景: "${sceneToApply}" (段落 ${currentIndex + 1}/${segments.length})`);
+  }
+
+  queueEffectsSyncForSegmentDisplay($overlay, state, currentIndex, { isNewMessage });
+
+  const $nextBtn = $overlay.find('[data-action="next"]');
+  const hasNextSegment = !!segments[currentIndex + 1];
+  console.log(`[${SCRIPT_NAME}] updateGlobalOverlayContent - hasNextSegment=${hasNextSegment}, isGeneratingResponse=${getIsGeneratingResponse()}`);
+
+  if (!hasNextSegment) {
+    if (getIsGeneratingResponse()) {
+      console.log(`[${SCRIPT_NAME}] updateGlobalOverlayContent - 启动动画`);
+      updateNextBtnForGeneratingState();
+    } else {
+      console.log(`[${SCRIPT_NAME}] updateGlobalOverlayContent - 显示END`);
+      stopNextBtnAnimation();
+      $nextBtn.html('END <i class="fa-solid fa-check"></i>');
+    }
+  } else {
+    console.log(`[${SCRIPT_NAME}] updateGlobalOverlayContent - 显示NEXT`);
+    stopNextBtnAnimation();
+    $nextBtn.html('NEXT <i class="fa-solid fa-chevron-right"></i>');
+  }
+
+  updateLocationTimeDisplay();
+
+  if (isNewMessage && !suppressTTS && settings.ttsEnabled && settings.ttsAutoPlay && !isNarration && !isCg) {
+    const segmentId = `${mesIdStr}_${currentIndex}`;
+    TTSManager.stop();
+    TTSManager.speak(displaySegment, segmentId);
+  }
+
+  $overlay.find('.gal-game-container').attr('data-mes-id', mesIdStr);
+}
+
+export async function updateOverlaySegmentDisplay(state, expectedRenderToken = null, source = 'unknown') {
+  if (!state) return false;
+
+  const isRenderTokenStale = () =>
+    expectedRenderToken !== null && expectedRenderToken !== (Number(state.renderToken) || 0);
+  if (isRenderTokenStale()) return false;
+
+  const $overlay = $('#gal-global-overlay');
+  const currentIndex = state.currentIndex;
+  const segment = state.segments[currentIndex];
+  if (!segment) return false;
+
+  Live2DPreloadManager.preloadFromSegments(state.segments, currentIndex, 'segment-display');
+
+  if (expectedRenderToken !== null) {
+    $overlay.attr('data-render-token', String(expectedRenderToken));
+  }
+
+  const speaker = segment.speaker;
+  const resolvedSpeaker = resolveCharacterIdByKeywords(speaker) || speaker;
+  const isNarration = segment.type === 'narration';
+  const isCg = segment.type === 'cg';
+  const forceInstantRender = shouldForceInstantBySource(source);
+
+  const $nameBadge = $overlay.find('.gal-name-badge');
+  cancelTypewriter();
+  syncTwilightBrandText($overlay);
+
+  if (isCg) {
+    setStyledPresentationMode($overlay, false);
+    hideStyledStage($overlay);
+    $nameBadge.find('span').text('CG');
+    $nameBadge.removeClass('gal-narrator-label');
+    const mesId = $overlay.find('.gal-game-container').attr('data-mes-id');
+    const cgSrc = getCapturedCgImage(mesId, segment.cgIndex);
+    if (cgSrc) {
+      $overlay.find('.gal-dialog-text').html(
+        '<img class="gal-cg-thumbnail" src="' + cgSrc.replace(/"/g, '&quot;') + '" />'
+      );
+    } else {
+      $overlay.find('.gal-dialog-text').text('图片生成中...');
+    }
+  } else if (segment.type === 'styled') {
+    setStyledPresentationMode($overlay, true);
+    const styledLabel = {
+      '手机短信': '📱 短信', 'sms': '📱 SMS', '微信': '📱 微信', 'wechat': '📱 WeChat',
+      '信纸': '✉️ 信件', 'letter': '✉️ Letter',
+      '羊皮纸': '📜 古卷', 'parchment': '📜 Parchment', '古卷': '📜 古卷',
+      '新闻': '📰 新闻', '报纸': '📰 报纸', 'newspaper': '📰 News', 'news': '📰 News',
+      '电脑屏幕': '💻 终端', '终端': '💻 终端', 'terminal': '💻 Terminal', 'computer': '💻 Computer',
+      '便签': '📌 便签', '纸条': '📌 纸条', 'note': '📌 Note', 'sticky': '📌 Sticky',
+      '日记': '📖 日记', 'diary': '📖 Diary', 'journal': '📖 Journal',
+      '公告': '📢 公告', '通知': '📢 通知', 'bulletin': '📢 Bulletin', 'notice': '📢 Notice',
+    }[segment.styleType] || segment.styleType;
+    $nameBadge.find('span').text(styledLabel);
+    $nameBadge.removeClass('gal-narrator-label');
+    const styledHtml = renderStyledContent(segment);
+    $overlay.find('.gal-dialog-text').text('');
+    showStyledStage($overlay, styledHtml);
+  } else {
+    setStyledPresentationMode($overlay, false);
+    hideStyledStage($overlay);
+    $nameBadge.find('span').text(resolvedSpeaker || '旁白');
+    if (isNarration) {
+      $nameBadge.addClass('gal-narrator-label');
+    } else {
+      $nameBadge.removeClass('gal-narrator-label');
+    }
+    renderTypewriterText($overlay.find('.gal-dialog-text'), segment.text || '', {
+      instant: forceInstantRender || !shouldUseTypewriterForSegment(segment),
+    });
+  }
+
+  const total = state.segments.length;
+  const progressPercent = total > 0 ? ((currentIndex + 1) / total) * 100 : 0;
+  $overlay.find('.gal-progress-bar').css('width', `${progressPercent}%`);
+
+  const isEnd = currentIndex >= total - 1;
+  const $nextBtn = $overlay.find('[data-action="next"]');
+  const $twilightNextIndicator = $overlay.find('.gal-twilight-dialog-next-indicator');
+  console.log(`[${SCRIPT_NAME}] 更新NEXT按钮 - isEnd=${isEnd}, isGeneratingResponse=${getIsGeneratingResponse()}`);
+
+  if ($twilightNextIndicator.length) {
+    if (isEnd) {
+      $twilightNextIndicator.attr('data-state', 'end');
+      $twilightNextIndicator.html('<i class="fa-solid fa-flag-checkered"></i>');
+    } else {
+      $twilightNextIndicator.attr('data-state', 'next');
+      $twilightNextIndicator.html('<i class="fa-solid fa-chevron-down"></i>');
+    }
+  }
+
+  if (isEnd) {
+    if (getIsGeneratingResponse() && !checkSillyTavernGenerating()) {
+      console.log(`[${SCRIPT_NAME}] 状态修正：SillyTavern 未在生成，重置 isGeneratingResponse`);
+      resetGenerationState('状态修正 - SillyTavern 未在生成');
+    }
+    if (getIsGeneratingResponse()) {
+      console.log(`[${SCRIPT_NAME}] 启动动画`);
+      updateNextBtnForGeneratingState();
+    } else {
+      console.log(`[${SCRIPT_NAME}] 显示END`);
+      stopNextBtnAnimation();
+      $nextBtn.html('END <i class="fa-solid fa-check"></i>');
+    }
+    // 自动弹出选项
+    if (_renderGalgameChoicesRef) {
+      const pendingOpts = getPendingOptions();
+      if (pendingOpts && pendingOpts.length > 0 && !getGalgameChoicesVisible()) {
+        console.log(`[${SCRIPT_NAME}] 已翻页到末尾，自动弹出选项面板`);
+        _renderGalgameChoicesRef(pendingOpts);
+      }
+    }
+  } else {
+    console.log(`[${SCRIPT_NAME}] 显示NEXT`);
+    stopNextBtnAnimation();
+    $nextBtn.html('NEXT <i class="fa-solid fa-chevron-right"></i>');
+  }
+
+  await SpriteManager.applySpriteCommands($overlay, segment.spriteCommands, expectedRenderToken);
+  if (isRenderTokenStale()) return false;
+
+  clearSpritesOnBackgroundCommand($overlay, segment);
+  const expression = segment.expression || '默认';
+  await SpriteManager.updateSprite($overlay, resolvedSpeaker, expression, expectedRenderToken);
+  if (isRenderTokenStale()) return false;
+
+  const sceneToApply = segment.backgroundScene || state.parsedContent?.currentBackground?.scene;
+  if (sceneToApply) {
+    await SpriteManager.applySceneTint($overlay, sceneToApply);
+    if (isRenderTokenStale()) return false;
+    console.log(`[${SCRIPT_NAME}] [DEBUG] updateOverlaySegmentDisplay 应用背景: "${sceneToApply}" (段落 ${currentIndex + 1}/${total})`);
+  }
+
+  queueEffectsSyncForSegmentDisplay($overlay, state, currentIndex);
+
+  return true;
+}
+
+export async function refreshOverlayFromLastAiMessage() {
+  if (!getIsEnabled()) return;
+
+  const $allMes = $('#chat > .mes');
+  let $lastAiMes = null;
+  $allMes.each(function () {
+    if ($(this).attr('is_user') !== 'true') {
+      $lastAiMes = $(this);
+    }
+  });
+
+  if (!$lastAiMes || !$lastAiMes.length) {
+    console.log(`[${SCRIPT_NAME}] 未找到AI消息`);
+    return;
+  }
+
+  const mesId = $lastAiMes.attr('mesid');
+  const $mesText = $lastAiMes.find('.mes_text');
+  const domVisibleContent = getMesTextContentForGalgame($mesText[0]);
+
+  let contentToProcess = getFormattedSwipeContent(mesId);
+  if (!contentToProcess) {
+    const rawMessageContent = getRawMessageContent(mesId);
+    if (rawMessageContent) {
+      if (RE_GAL_TAGS.test(rawMessageContent)) {
+        contentToProcess = rawMessageContent;
+      } else if (/<[a-z][\s\S]*?>/i.test(rawMessageContent) && domVisibleContent) {
+        contentToProcess = domVisibleContent;
+      } else {
+        contentToProcess = rawMessageContent;
+      }
+    }
+  }
+  if (!contentToProcess) {
+    contentToProcess = domVisibleContent;
+    if (!contentToProcess) return;
+  }
+
+  const hasGalTags = RE_GAL_TAGS.test(contentToProcess);
+  if (!hasGalTags) {
+    console.log(`[${SCRIPT_NAME}] 最后AI消息不包含Galgame标签`);
+    return;
+  }
+
+  const parsed = parseGalgameContent(contentToProcess);
+  if (parsed.segments.length === 0) return;
+
+  detectAndCaptureCg(mesId, $lastAiMes[0], parsed);
+
+  await updateGlobalOverlayContent(mesId, parsed);
+  showGlobalOverlay();
+  updateLocationTimeDisplay();
+}
+
+export async function renderGalgameMessage(mesId, parsedContent) {
+  await updateGlobalOverlayContent(mesId, parsedContent);
+  showGlobalOverlay();
+  updateLocationTimeDisplay();
+}
+
+// ============================================
+// CG 图片捕获机制
+// ============================================
+
+const capturedCgImages = new Map(); // mesId -> [imgSrc, ...]
+const cgObservers = new Map(); // mesId -> MutationObserver
+
+export function getCapturedCgImage(mesId, cgIndex) {
+  const images = capturedCgImages.get(String(mesId));
+  return images ? images[cgIndex] || null : null;
+}
+
+function collectCgImages(mesId, mesTextNode, cgCount) {
+  const imgs = mesTextNode.querySelectorAll('.st-chatu8-collapse-content img');
+  const sources = Array.from(imgs)
+    .map(img => img.src || img.getAttribute('src') || '')
+    .filter(src => src && src !== '');
+
+  const existing = capturedCgImages.get(String(mesId)) || [];
+  if (sources.length !== existing.length || sources.some((s, i) => s !== existing[i])) {
+    capturedCgImages.set(String(mesId), sources);
+    refreshCgDisplayIfNeeded(mesId);
+  }
+}
+
+function refreshCgDisplayIfNeeded(mesId) {
+  const $overlay = $('#gal-global-overlay');
+  if (!$overlay.length || !$overlay.hasClass('active')) return;
+
+  const currentMesId = $overlay.find('.gal-game-container').attr('data-mes-id');
+  if (String(currentMesId) !== String(mesId)) return;
+
+  const state = messageSegmentState.get(String(mesId));
+  if (!state) return;
+
+  const currentSegment = state.segments[state.currentIndex];
+  if (!currentSegment || currentSegment.type !== 'cg') return;
+
+  const cgSrc = getCapturedCgImage(mesId, currentSegment.cgIndex);
+  if (cgSrc) {
+    $overlay.find('.gal-dialog-text').html(
+      '<img class="gal-cg-thumbnail" src="' + cgSrc.replace(/"/g, '&quot;') + '" />'
+    );
+  }
+}
+
+/**
+ * 从 DOM 检测 CG 图片并注入段落
+ * 直接扫描 .mes_text 中的 .st-chatu8-collapse-content 容器
+ */
+export function detectAndCaptureCg(mesId, mesNode, parsed) {
+  const mesText = mesNode.querySelector ? mesNode.querySelector('.mes_text') : $(mesNode).find('.mes_text')[0];
+  if (!mesText) return 0;
+
+  const containers = mesText.querySelectorAll('.st-chatu8-collapse-content');
+  if (containers.length === 0) return 0;
+
+  const mesIdStr = String(mesId);
+
+  // 立即抓取图片 src
+  const sources = [];
+  containers.forEach((container, i) => {
+    const img = container.querySelector('img');
+    const src = img ? (img.src || '') : '';
+    sources.push(src);
+  });
+  capturedCgImages.set(mesIdStr, sources.filter(s => s));
+
+  // 确定 CG 在 DOM 中的位置，按 <p> 兄弟顺序插入
+  const cgParentPs = new Set();
+  containers.forEach(c => {
+    const p = c.closest('p');
+    if (p) cgParentPs.add(p);
+  });
+
+  // 移除旧 CG 段落（避免缓存重复）
+  const baseSegments = parsed.segments.filter(s => s.type !== 'cg');
+
+  // 遍历 .mes_text 下的 <p>，按顺序交织普通段落和 CG 段落
+  const allPs = mesText.querySelectorAll(':scope > p');
+  let regularIdx = 0;
+  let cgIdx = 0;
+  const merged = [];
+
+  allPs.forEach(p => {
+    if (cgParentPs.has(p)) {
+      const prevScene = merged.length > 0 ? merged[merged.length - 1].backgroundScene : null;
+      merged.push({ type: 'cg', speaker: null, text: '', expression: null, cgIndex: cgIdx++, backgroundScene: prevScene });
+    } else {
+      if (regularIdx < baseSegments.length) {
+        merged.push(baseSegments[regularIdx++]);
+      }
+    }
+  });
+  // 追加剩余段落（如长段落切分产生的额外段落）
+  while (regularIdx < baseSegments.length) {
+    merged.push(baseSegments[regularIdx++]);
+  }
+
+  parsed.segments = merged;
+
+  // MutationObserver 监听异步图片加载
+  if (cgObservers.has(mesIdStr)) {
+    cgObservers.get(mesIdStr).disconnect();
+  }
+  const observer = new MutationObserver(() => {
+    collectCgImages(mesIdStr, mesText, containers.length);
+  });
+  observer.observe(mesText, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['src'],
+  });
+  cgObservers.set(mesIdStr, observer);
+
+  return cgIdx;
+}
+
+// 延迟引用
+let _renderGalgameChoicesRef = null;
+
+export function setOverlayContentRefs({ renderGalgameChoices }) {
+  if (renderGalgameChoices) _renderGalgameChoicesRef = renderGalgameChoices;
+}
