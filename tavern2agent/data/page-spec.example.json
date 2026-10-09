@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "theme": {
+    "id": "default",
+    "colors": {
+      "background": "#000000",
+      "surface": "#111111",
+      "primary": "#ffffff",
+      "text": "#ffffff",
+      "accent": "#ff00ff"
+    },
+    "fonts": {
+      "heading": "sans-serif",
+      "body": "sans-serif"
+    }
+  },
+  "layout": {
+    "hero": true,
+    "sidebar": false,
+    "tabs": ["剧情"]
+  },
+  "components": [
+    {
+      "id": "hero",
+      "type": "Hero",
+      "props": {
+        "title": "Example Card"
+      }
+    },
+    {
+      "id": "character",
+      "type": "CharacterPanel",
+      "props": {}
+    },
+    {
+      "id": "opening",
+      "type": "OpeningScene",
+      "props": {}
+    }
+  ]
+}

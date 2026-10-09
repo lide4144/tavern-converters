@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://tavern2agent.local/page-spec.json",
+  "title": "Tavern2Agent Page Spec",
+  "type": "object",
+  "required": ["version", "theme", "layout", "components"],
+  "properties": {
+    "version": { "type": "integer", "const": 1 },
+    "source": {
+      "type": "object",
+      "properties": {
+        "cardName": { "type": "string" },
+        "archetype": { "type": "string" },
+        "complexity": { "enum": ["prompt-only", "evented-light", "evented-standard"] }
+      }
+    },
+    "theme": {
+      "type": "object",
+      "required": ["id", "colors", "fonts"],
+      "properties": {
+        "id": { "type": "string" },
+        "base": { "type": "string" },
+        "colors": {
+          "type": "object",
+          "properties": {
+            "background": { "type": "string" },
+            "surface": { "type": "string" },
+            "primary": { "type": "string" },
+            "text": { "type": "string" },
+            "accent": { "type": "string" }
+          }
+        },
+        "fonts": {
+          "type": "object",
+          "properties": {
+            "heading": { "type": "string" },
+            "body": { "type": "string" }
+          }
+        }
+      }
+    },
+    "layout": {
+      "type": "object",
+      "properties": {
+        "hero": { "type": "boolean" },
+        "sidebar": { "type": "boolean" },
+        "tabs": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "type"],
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "enum": ["Hero", "CharacterPanel", "StatePanel", "SceneLog", "ActionBar", "RelationshipMap", "ImageGenButton", "Gallery", "OpeningScene"] },
+          "props": { "type": "object" }
+        }
+      }
+    },
+    "allowedTools": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "stateProjection": {
+      "type": "object",
+      "properties": {
+        "visiblePaths": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "imageGen": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "provider": { "type": "string" },
+        "endpoint": { "type": "string" },
+        "modelType": { "enum": ["sd", "diffusion"] },
+        "workflow": { "type": "string" },
+        "promptTemplate": { "type": "string" },
+        "promptNodeId": { "type": "string" },
+        "basePrompt": { "type": "string" },
+        "negativePrompt": { "type": "string" },
+        "outputDir": { "type": "string" },
+        "triggers": {
+          "type": "object",
+          "properties": {
+            "eventDriven": { "type": "array", "items": { "type": "string" } },
+            "stateDriven": { "type": "array", "items": { "type": "string" } },
+            "multiAngleFallback": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    }
+  }
+}

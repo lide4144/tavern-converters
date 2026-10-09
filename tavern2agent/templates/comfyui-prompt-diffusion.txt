@@ -1,0 +1,7 @@
+masterpiece, best quality, highly detailed.
+
+A character named {{characterName}}.
+Fixed appearance: {{fixedAttributes}}.
+Current appearance: {{dynamicAttributes}}.
+Scene: {{sceneDescription}}.
+Style: {{styleBoost}}.

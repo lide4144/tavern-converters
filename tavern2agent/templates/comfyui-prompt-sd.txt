@@ -1,0 +1,10 @@
+masterpiece, best quality, highly detailed
+
+# 固定属性（从角色卡读取，禁止改写）
+{{fixedAttributes}}
+
+# 动态属性（继承当前场景状态）
+{{dynamicAttributes}}
+
+# 场景/风格增强
+{{styleBoost}}

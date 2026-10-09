@@ -1,0 +1,42 @@
+// extension.ts —— pi extension 入口（模板）
+// 由 Tavern2Agent skill 生成到目标项目根目录。
+
+import { startWebServer } from "./engine/web-server";
+
+// 以下类型/函数应根据实际 pi extension SDK 替换。
+interface ExtensionContext {
+  workspaceState: {
+    update: (key: string, value: any) => Promise<void> | void;
+  };
+}
+
+function loadState(_context: ExtensionContext): any {
+  // 从 pi session custom entry 或内存读取当前 state 投影。
+  return {};
+}
+
+async function dispatchEvent(_event: any): Promise<any> {
+  // 调用 engine dispatch，将领域事件写入 state。
+  return { ok: true };
+}
+
+function registerTools(_context: ExtensionContext): any[] {
+  // 注册其他工具；image-gen 工具由 tools/image-gen.ts 提供。
+  return [];
+}
+
+export function activate(context: ExtensionContext) {
+  const tools = registerTools(context);
+
+  const port = startWebServer(context, {
+    getState: () => loadState(context),
+    dispatch: async (event) => dispatchEvent(event),
+    callTool: async (tool, args) => {
+      const t = tools.find((x: any) => x.name === tool);
+      if (!t) throw new Error(`Tool not found: ${tool}`);
+      return await t.execute(args, { state: loadState(context) });
+    },
+  });
+
+  console.log(`[tavern2agent] web server started on http://127.0.0.1:${port}`);
+}
