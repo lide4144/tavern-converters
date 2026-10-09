@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Galgame UI Plugin Config v2",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "galgame_ui_plugin_config_v2"
+    },
+    "assets": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "activePackId": { "type": "string" },
+        "packs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["packId"],
+            "properties": {
+              "packId": { "type": "string" },
+              "name": { "type": "string" },
+              "remoteAssetsUrl": { "type": "string" },
+              "remoteBaseUrl": { "type": "string" }
+            }
+          }
+        },
+        "resourceModes": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "sprites": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "mode": { "type": "string", "enum": ["local", "remote", "skip-export"] },
+                "remoteAssetsUrl": { "type": "string" },
+                "remoteBaseUrl": { "type": "string" }
+              }
+            },
+            "backgrounds": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "mode": { "type": "string", "enum": ["local", "remote", "skip-export"] },
+                "remoteAssetsUrl": { "type": "string" },
+                "remoteBaseUrl": { "type": "string" }
+              }
+            },
+            "live2d": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "mode": { "type": "string", "enum": ["embedded", "idb-placeholder", "skip-local", "remote"] },
+                "includeLocalPlaceholder": { "type": "boolean" },
+                "remoteInput": { "type": "string" },
+                "remoteAssetsUrl": { "type": "string" },
+                "remoteBaseUrl": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "live2d": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabledMap": {
+          "type": "object",
+          "additionalProperties": { "type": "boolean" }
+        },
+        "models": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "source": {
+                "type": "string",
+                "enum": ["remote", "local", "idb", "embedded"]
+              },
+              "modelUrl": { "type": "string" },
+              "modelId": { "type": "string" },
+              "runtimeType": {
+                "type": "string",
+                "enum": ["legacy", "cubism5"]
+              },
+              "cubismVersion": {
+                "type": ["number", "null"],
+                "enum": [2, 4, 5, null]
+              },
+              "transform": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                  "slot": { "type": "string", "enum": ["left", "center", "right"] },
+                  "scaleBase": { "type": "string" },
+                  "scale": { "type": "number" },
+                  "offsetX": { "type": "number" },
+                  "offsetY": { "type": "number" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "tts": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "characterVoice": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "characterKeywords": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "custom": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "locationStatusHtml": { "type": "string" },
+        "timeStatusHtml": { "type": "string" },
+        "locationStatusIconClass": { "type": "string" },
+        "timeStatusIconClass": { "type": "string" },
+        "uiAccess": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "hiddenAssetTabs": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "sprites",
+                  "backgrounds",
+                  "title-screen",
+                  "special-cgs",
+                  "special-cg-rules",
+                  "maps",
+                  "skin",
+                  "imagegen",
+                  "opening",
+                  "bgm",
+                  "custom"
+                ]
+              }
+            },
+            "unlock": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "mode": { "type": "string", "enum": ["plaintext"] },
+                "password": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "bgm": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "whitelist": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}
+
