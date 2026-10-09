@@ -5,3 +5,4 @@
 ## Merged sources (pre-archive squash snapshots)
 - `tavern2agent`
 - `galgame`
+- `novel-injector`
